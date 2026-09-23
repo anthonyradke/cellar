@@ -10,6 +10,9 @@ back a single file on a live box. Paths below use `/home/me`; put in the real ho
 
 If those are lost along with the server, the backups can't be read.
 
+Check the daily download cap in B2 (Caps & Alerts) first. A full restore is several GB, and once the cap is hit B2
+refuses every read until midnight UTC.
+
 ## 1. Get restic talking to the repository
 
 Do this right after the OS, SSH and sudo are set up, before rebuilding anything else, because the backup holds the

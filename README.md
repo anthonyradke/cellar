@@ -102,7 +102,9 @@ systemctl list-timers 'cellar-*'
 
 1. Create a private B2 bucket and set its lifecycle to keep prior versions for 30 days, so a compromised server
    can't wipe the backups for good right away. Make an application key that's restricted to that bucket, with read
-   and write.
+   and write. Under Caps & Alerts, raise the daily download cap above the free 1 GB (a dollar a day is plenty; you
+   only pay for what's used). When the cap is hit, B2 refuses every read, including the ones a nightly backup needs,
+   and a full restore is bigger than 1 GB.
 2. `sudo install -d -m 700 /etc/cellar && sudo nano /etc/cellar/b2.env` (see `etc/b2.env.example`), then
    `sudo chmod 600 /etc/cellar/b2.env`.
 3. `sudo ./install.sh`. It creates the other config files from the examples, which then need editing for the

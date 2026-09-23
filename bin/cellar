@@ -432,7 +432,10 @@ def main():
     p.add_argument("args", nargs=argparse.REMAINDER)
     p.set_defaults(func=cmd_restic)
     sub.add_parser("init").set_defaults(func=cmd_init)
-    args = parser.parse_args()
+    if sys.argv[1:2] == ["restic"]:
+        args = argparse.Namespace(func=cmd_restic, args=sys.argv[2:])
+    else:
+        args = parser.parse_args()
 
     if os.geteuid() != 0:
         sys.exit("cellar: run as root (sudo cellar ...)")
