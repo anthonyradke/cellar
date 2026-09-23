@@ -1,0 +1,15 @@
+[Unit]
+Description=cellar monthly restore drill
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cellar drill
+# Stay out of the way of the game servers.
+Nice=10
+CPUSchedulingPolicy=batch
+IOSchedulingClass=idle
+CacheDirectory=cellar
+CacheDirectoryMode=0700
+TimeoutStartSec=1h

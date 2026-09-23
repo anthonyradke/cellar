@@ -1,0 +1,7 @@
+# /etc/cellar/excludes.txt: restic exclude patterns, one per line.
+# Live SQLite files are backed up through sqlite.txt instead, so exclude the originals here.
+/etc/pihole/pihole-FTL.db*
+/home/you/minecraft/world.bak-*
+/home/you/minecraft/logs
+/home/you/minecraft/libraries
+/home/you/minecraft/versions

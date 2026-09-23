@@ -1,0 +1,10 @@
+# /etc/cellar/sources.txt: what to back up, one path per line. Shell globs are expanded.
+# `cellar sources` shows which lines match nothing.
+/etc
+/usr/local/bin
+/var/spool/cron/crontabs
+# Staged copies of the databases in sqlite.txt. Keep this line.
+/var/lib/cellar/staging
+/home/you/minecraft
+/home/you/.config/unity3d/IronGate/Valheim
+/home/you/projects/*/NOTES.md

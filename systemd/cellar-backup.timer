@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the cellar backup every night
+
+[Timer]
+OnCalendar=*-*-* 04:30 America/Denver
+Persistent=true
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,448 @@
+#!/usr/bin/python3
+"""cellar: nightly restic backups to an S3-compatible bucket, with checks and restore drills.
+
+Usage:
+  cellar backup [--tag TAG]     back up everything in sources.txt (default tag: manual)
+  cellar check [--subset 10%]   verify the repository and a random slice of its data
+  cellar drill                  restore the files in drill.txt to a temp dir and check them
+  cellar status                 show the last results (from /var/lib/cellar/status.json)
+  cellar snapshots              list snapshots
+  cellar sources                show which source paths exist and which are missing
+  cellar restore SNAPSHOT --target DIR [--include PATTERN ...]
+  cellar restic ARGS...         run restic with cellar's credentials
+  cellar init                   create the repository if it doesn't exist yet
+
+Settings live in /etc/cellar (see etc/*.example in the repo). Needs root.
+"""
+import argparse
+import contextlib
+import datetime
+import fcntl
+import glob
+import hashlib
+import json
+import os
+import pwd
+import shutil
+import signal
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import urllib.request
+
+ETC = "/etc/cellar"
+STATE = "/var/lib/cellar"
+STATUS = f"{STATE}/status.json"
+STAGING = f"{STATE}/staging"
+WORK = f"{STATE}/work"
+CACHE = "/var/cache/cellar"
+LOCK = "/run/lock/cellar.lock"
+SCHEMA = 1
+
+KEEP = ["--keep-daily", "7", "--keep-weekly", "5", "--keep-monthly", "12"]
+
+# Copies a live SQLite database with the backup API and checks the copy. Runs as the
+# database's owner so SQLite never creates root-owned -wal/-shm files next to the original.
+SQLITE_COPY = """
+import sqlite3, sys
+src = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+dst = sqlite3.connect(sys.argv[2])
+src.backup(dst)
+result = dst.execute("pragma integrity_check").fetchone()[0]
+dst.close()
+src.close()
+if result != "ok":
+    sys.exit(f"integrity_check failed: {result}")
+"""
+
+
+class Failed(Exception):
+    pass
+
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def read_env(path):
+    env = {}
+    if not os.path.exists(path):
+        return env
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            env[key.strip()] = value.strip().strip("'\"")
+    return env
+
+
+def read_list(name):
+    path = f"{ETC}/{name}"
+    if not os.path.exists(path):
+        return []
+    with open(path) as f:
+        return [l.strip() for l in f if l.strip() and not l.lstrip().startswith("#")]
+
+
+CONF = read_env(f"{ETC}/cellar.env")
+
+
+def restic_env():
+    b2 = read_env(f"{ETC}/b2.env")
+    if not b2.get("RESTIC_REPOSITORY"):
+        raise Failed(f"{ETC}/b2.env is missing or has no RESTIC_REPOSITORY")
+    env = dict(os.environ, **b2)
+    env["RESTIC_PASSWORD_FILE"] = f"{ETC}/restic.pass"
+    env.setdefault("RESTIC_CACHE_DIR", CACHE)
+    return env
+
+
+def restic(*args, ok=(0,), quiet=False):
+    """Run restic, echo its stderr, return (exit code, stdout). Raises unless the code is in ok."""
+    cmd = ["restic", "--retry-lock", "30m", *args]
+    p = subprocess.run(cmd, env=restic_env(), text=True, capture_output=True)
+    if p.stderr and not quiet:
+        sys.stderr.write(p.stderr)
+    if p.returncode not in ok:
+        tail = " ".join(p.stderr.strip().splitlines()[-3:]) or f"exit code {p.returncode}"
+        raise Failed(f"restic {args[0]}: {tail}")
+    return p.returncode, p.stdout
+
+
+def restic_json(*args):
+    return json.loads(restic("--json", *args)[1])
+
+
+def status_merge(**sections):
+    try:
+        with open(STATUS) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        data = {}
+    data.update(sections)
+    data["schema"] = SCHEMA
+    data["updated"] = now()
+    tmp = STATUS + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, STATUS)
+    return data
+
+
+def healthcheck(suffix="", body=""):
+    url = CONF.get("HC_URL")
+    if not url:
+        return
+    try:
+        req = urllib.request.Request(url.rstrip("/") + suffix, data=body[-10000:].encode())
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        log(f"healthchecks ping failed: {e}")
+
+
+@contextlib.contextmanager
+def locked():
+    os.makedirs(os.path.dirname(LOCK), exist_ok=True)
+    with open(LOCK, "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+
+def sources():
+    """Expand sources.txt globs. Returns (existing paths, lines that matched nothing)."""
+    found, missing = [], []
+    for line in read_list("sources.txt"):
+        matches = sorted(glob.glob(line))
+        if not matches:
+            missing.append(line)
+        for m in map(os.path.realpath, matches):
+            if m not in found:
+                found.append(m)
+    return found, missing
+
+
+def stage():
+    """Fill the staging dir with consistent copies of live SQLite databases."""
+    shutil.rmtree(STAGING, ignore_errors=True)
+    os.makedirs(STAGING, mode=0o700)
+    os.makedirs(WORK, mode=0o755, exist_ok=True)
+    for src in read_list("sqlite.txt"):
+        if not os.path.exists(src):
+            raise Failed(f"sqlite.txt lists {src}, which doesn't exist")
+        owner = pwd.getpwuid(os.stat(src).st_uid)
+        dst = STAGING + src
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=WORK) as tmp:
+            os.chown(tmp, owner.pw_uid, owner.pw_gid)
+            out = os.path.join(tmp, "copy.db")
+            p = subprocess.run(["runuser", "-u", owner.pw_name, "--", "python3", "-c", SQLITE_COPY, src, out],
+                               text=True, capture_output=True)
+            if p.returncode != 0:
+                raise Failed(f"copying {src}: {p.stderr.strip()}")
+            shutil.move(out, dst)
+            os.chown(dst, 0, 0)
+            os.chmod(dst, 0o600)
+        log(f"staged {src} ({os.path.getsize(dst)} bytes)")
+
+
+def rcon(cmd, *args):
+    p = subprocess.run([cmd, *args], text=True, capture_output=True, timeout=120)
+    if p.returncode != 0:
+        raise Failed(f"{cmd} {' '.join(args)}: {(p.stderr or p.stdout).strip()}")
+    return p.stdout.strip()
+
+
+@contextlib.contextmanager
+def minecraft_paused():
+    """Turn off auto-save on running Minecraft servers while the backup reads their worlds."""
+    paused = []
+    try:
+        for pair in CONF.get("MINECRAFT", "").split():
+            unit, cmd = pair.split(":", 1)
+            if subprocess.run(["systemctl", "is-active", "--quiet", unit]).returncode != 0:
+                continue
+            rcon(cmd, "save-off")
+            paused.append(cmd)
+            log(f"{unit}: {rcon(cmd, 'save-all flush')}")
+        yield
+    finally:
+        for cmd in paused:
+            try:
+                rcon(cmd, "save-on")
+                log(f"{cmd}: save-on")
+            except Exception as e:
+                log(f"WARNING: {cmd} save-on failed, auto-save is still off: {e}")
+
+
+def source_sizes(snapshot, paths):
+    """Bytes per source path in a snapshot, from `restic ls`."""
+    sizes = {p: 0 for p in paths}
+    _, out = restic("--json", "ls", snapshot)
+    by_length = sorted(paths, key=len, reverse=True)
+    for line in out.splitlines():
+        node = json.loads(line)
+        if node.get("type") != "file":
+            continue
+        for p in by_length:
+            if node["path"] == p or node["path"].startswith(p.rstrip("/") + "/"):
+                sizes[p] += node.get("size", 0)
+                break
+    return [{"path": p, "bytes": b} for p, b in sizes.items()]
+
+
+def repo_stats():
+    snaps = restic_json("snapshots")
+    raw = restic_json("stats", "--mode", "raw-data")
+    return {"snapshots": len(snaps), "size_bytes": raw.get("total_size", 0), "measured": now()}
+
+
+def cmd_backup(args):
+    started = now()
+    record = {"started": started, "finished": None, "result": "running", "error": None, "tag": args.tag}
+    status_merge(backup=record)
+    healthcheck("/start")
+    try:
+        with locked():
+            stage()
+            paths, missing = sources()
+            if not paths:
+                raise Failed("no source paths exist; check /etc/cellar/sources.txt")
+            for m in missing:
+                log(f"WARNING: source matched nothing: {m}")
+            exclude = ["--exclude-file", f"{ETC}/excludes.txt"] if os.path.exists(f"{ETC}/excludes.txt") else []
+            with minecraft_paused():
+                code, out = restic("--json", "backup", "--tag", args.tag, *exclude, *paths, ok=(0, 3))
+            summary = next((json.loads(l) for l in out.splitlines()
+                            if l.startswith("{") and json.loads(l).get("message_type") == "summary"), {})
+            restic("forget", "--group-by", "host,tags", *KEEP, "--prune")
+            record.update(
+                result="ok" if code == 0 else "partial",
+                error=None if code == 0 else "some files could not be read (see journal); snapshot saved without them",
+                snapshot=summary.get("snapshot_id"),
+                bytes_added=summary.get("data_added"),
+                bytes_uploaded=summary.get("data_added_packed"),
+                bytes_total=summary.get("total_bytes_processed"),
+                files_new=summary.get("files_new"),
+                files_changed=summary.get("files_changed"),
+                files_total=summary.get("total_files_processed"),
+                missing_sources=missing,
+                finished=now(),
+            )
+            extra = {"last_success": record["finished"], "repo": repo_stats()}
+            if record["snapshot"]:
+                extra["sources"] = source_sizes(record["snapshot"], paths)
+            status_merge(backup=record, **extra)
+    except BaseException as e:
+        record.update(result="failed", error=str(e) or type(e).__name__, finished=now())
+        status_merge(backup=record)
+        healthcheck("/fail", record["error"])
+        raise
+    log(f"backup {record['result']}: snapshot {record['snapshot']}, {record['bytes_added']} bytes added")
+    healthcheck("", json.dumps(record))
+
+
+def cmd_check(args):
+    record = {"started": now(), "finished": None, "result": "running", "error": None, "subset": args.subset}
+    status_merge(check=record)
+    try:
+        with locked():
+            restic("check", f"--read-data-subset={args.subset}")
+        record.update(result="ok", finished=now())
+    except BaseException as e:
+        record.update(result="failed", error=str(e) or type(e).__name__, finished=now())
+        raise
+    finally:
+        status_merge(check=record)
+    log("check ok")
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def cmd_drill(args):
+    record = {"started": now(), "finished": None, "result": "running", "error": None, "files": []}
+    status_merge(drill=record)
+    try:
+        patterns = read_list("drill.txt")
+        if not patterns:
+            raise Failed(f"{ETC}/drill.txt lists no files")
+        with locked(), tempfile.TemporaryDirectory(dir=STATE, prefix="drill-") as tmp:
+            record["snapshot"] = restic_json("snapshots", "latest")[0]["short_id"]
+            includes = [a for p in patterns for a in ("--include", p)]
+            # --verify re-reads every restored file and compares it with the snapshot.
+            restic("restore", record["snapshot"], "--target", tmp, "--verify", *includes)
+            problems = []
+            for pattern in patterns:
+                matches = sorted(glob.glob(tmp + pattern))
+                if not matches:
+                    problems.append(f"nothing restored for {pattern}")
+                for path in matches:
+                    entry = {"path": path[len(tmp):], "bytes": os.path.getsize(path), "sha256": sha256(path)}
+                    if entry["bytes"] == 0:
+                        problems.append(f"{entry['path']} is empty")
+                    if path.endswith((".db", ".sqlite")):
+                        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+                        entry["integrity"] = con.execute("pragma integrity_check").fetchone()[0]
+                        con.close()
+                        if entry["integrity"] != "ok":
+                            problems.append(f"{entry['path']}: integrity_check {entry['integrity']}")
+                    record["files"].append(entry)
+                    log(f"restored {entry['path']} ({entry['bytes']} bytes) {entry.get('integrity', '')}")
+            if problems:
+                raise Failed("; ".join(problems))
+        record.update(result="ok", finished=now())
+    except BaseException as e:
+        record.update(result="failed", error=str(e) or type(e).__name__, finished=now())
+        raise
+    finally:
+        status_merge(drill=record)
+    log("drill ok")
+
+
+def cmd_status(args):
+    try:
+        with open(STATUS) as f:
+            data = json.load(f)
+    except OSError:
+        sys.exit("no status yet: cellar hasn't run")
+    if args.json:
+        print(json.dumps(data, indent=2))
+        return
+    for key in ("backup", "check", "drill"):
+        s = data.get(key) or {}
+        line = f"{key:7} {s.get('result', 'never'):8} {s.get('finished') or s.get('started') or ''}"
+        if s.get("error"):
+            line += f"  {s['error']}"
+        print(line)
+    repo = data.get("repo") or {}
+    if repo:
+        print(f"repo    {repo['snapshots']} snapshots, {repo['size_bytes'] / 1e9:.2f} GB")
+    for s in data.get("sources") or []:
+        print(f"  {s['bytes'] / 1e6:10.1f} MB  {s['path']}")
+
+
+def cmd_sources(args):
+    paths, missing = sources()
+    for p in paths:
+        print(f"ok       {p}")
+    for m in missing:
+        print(f"missing  {m}")
+    if missing:
+        sys.exit(1)
+
+
+def cmd_snapshots(args):
+    print(restic("snapshots")[1], end="")
+
+
+def cmd_restore(args):
+    includes = [a for p in args.include for a in ("--include", p)]
+    restic("restore", args.snapshot, "--target", args.target, *includes)
+    log(f"restored {args.snapshot} into {args.target}")
+
+
+def cmd_restic(args):
+    os.execvpe("restic", ["restic", *args.args], restic_env())
+
+
+def cmd_init(args):
+    code, _ = restic("cat", "config", ok=(0, 10), quiet=True)
+    if code == 0:
+        log("repository already exists")
+        return
+    restic("init")
+    log("repository created")
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="cellar", description="restic backups for this machine")
+    sub = parser.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("backup")
+    p.add_argument("--tag", default="manual")
+    p.set_defaults(func=cmd_backup)
+    p = sub.add_parser("check")
+    p.add_argument("--subset", default="10%")
+    p.set_defaults(func=cmd_check)
+    sub.add_parser("drill").set_defaults(func=cmd_drill)
+    p = sub.add_parser("status")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_status)
+    sub.add_parser("sources").set_defaults(func=cmd_sources)
+    sub.add_parser("snapshots").set_defaults(func=cmd_snapshots)
+    p = sub.add_parser("restore")
+    p.add_argument("snapshot")
+    p.add_argument("--target", required=True)
+    p.add_argument("--include", action="append", default=[])
+    p.set_defaults(func=cmd_restore)
+    p = sub.add_parser("restic")
+    p.add_argument("args", nargs=argparse.REMAINDER)
+    p.set_defaults(func=cmd_restic)
+    sub.add_parser("init").set_defaults(func=cmd_init)
+    args = parser.parse_args()
+
+    if os.geteuid() != 0:
+        sys.exit("cellar: run as root (sudo cellar ...)")
+    # systemd stops a unit with SIGTERM; turn it into an exception so cleanup (save-on) still runs.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    try:
+        args.func(args)
+    except Failed as e:
+        sys.exit(f"cellar: {e}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,3 @@
+# /etc/cellar/sqlite.txt: live SQLite databases. Each is copied with SQLite's backup API into
+# /var/lib/cellar/staging<same path> before the backup, and that copy is what gets backed up.
+/home/you/projects/app/data/app.db

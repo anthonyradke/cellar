@@ -1,0 +1,15 @@
+[Unit]
+Description=cellar weekly repository check
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cellar check --subset 10%
+# Stay out of the way of the game servers.
+Nice=10
+CPUSchedulingPolicy=batch
+IOSchedulingClass=idle
+CacheDirectory=cellar
+CacheDirectoryMode=0700
+TimeoutStartSec=6h

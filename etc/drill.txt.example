@@ -1,0 +1,4 @@
+# /etc/cellar/drill.txt: files the monthly drill restores from the latest snapshot. Globs allowed.
+# Each must restore non-empty; .db/.sqlite files must also pass PRAGMA integrity_check.
+/var/lib/cellar/staging/home/you/projects/app/data/app.db
+/home/you/minecraft/world/level.dat

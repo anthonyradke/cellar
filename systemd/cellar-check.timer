@@ -1,0 +1,10 @@
+[Unit]
+Description=Check the cellar repository every week
+
+[Timer]
+OnCalendar=Sun *-*-* 05:30 America/Denver
+Persistent=true
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target
