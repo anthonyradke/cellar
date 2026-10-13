@@ -41,6 +41,10 @@ LOCK = "/run/lock/cellar.lock"
 SCHEMA = 1
 
 KEEP = ["--keep-daily", "7", "--keep-weekly", "5", "--keep-monthly", "12"]
+# Half-hourly snapshots (tag "frequent") are short-term restore points: kept for a day, left out
+# of KEEP so they never crowd out the dailies, and only pruned by the nightly run.
+FREQUENT = "frequent"
+KEEP_FREQUENT = ["--keep-within", "24h"]
 
 # Copies a live SQLite database with the backup API and checks the copy. Runs as the
 # database's owner so SQLite never creates root-owned -wal/-shm files next to the original.
@@ -263,7 +267,9 @@ def cmd_backup(args):
                 code, out = restic("--json", "backup", "--tag", args.tag, *exclude, *paths, ok=(0, 3))
             summary = next((json.loads(l) for l in out.splitlines()
                             if l.startswith("{") and json.loads(l).get("message_type") == "summary"), {})
-            restic("forget", "--group-by", "host,tags", *KEEP, "--prune")
+            restic("forget", "--tag", FREQUENT, *KEEP_FREQUENT)
+            if args.tag != FREQUENT:
+                restic("forget", "--group-by", "host,tags", *KEEP, "--keep-tag", FREQUENT, "--prune")
             record.update(
                 result="ok" if code == 0 else "partial",
                 error=None if code == 0 else "some files could not be read (see journal); snapshot saved without them",

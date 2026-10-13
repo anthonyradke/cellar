@@ -51,7 +51,7 @@ fi
 cellar init
 
 systemctl daemon-reload
-systemctl enable --now cellar-backup.timer cellar-check.timer cellar-drill.timer
+systemctl enable --now cellar-frequent.timer cellar-backup.timer cellar-check.timer cellar-drill.timer
 
 echo
 echo "Self-test:"
@@ -61,7 +61,7 @@ check() {
 }
 desc="repository reachable"; check cellar restic cat config
 desc="all sources exist";    check cellar sources
-for t in backup check drill; do
+for t in frequent backup check drill; do
     desc="cellar-$t.timer active"; check systemctl is-active --quiet "cellar-$t.timer"
 done
 [ "$fail" = 0 ] || { cellar sources || true; exit 1; }

@@ -1,0 +1,15 @@
+[Unit]
+Description=cellar half-hourly backup
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cellar backup --tag frequent
+# Stay out of the way of the game servers.
+Nice=10
+CPUSchedulingPolicy=batch
+IOSchedulingClass=idle
+CacheDirectory=cellar
+CacheDirectoryMode=0700
+TimeoutStartSec=2h

@@ -1,0 +1,9 @@
+[Unit]
+Description=Run a cellar backup every 30 minutes
+
+[Timer]
+OnCalendar=*-*-* *:15,45
+RandomizedDelaySec=2min
+
+[Install]
+WantedBy=timers.target
