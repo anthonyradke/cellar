@@ -1,61 +1,109 @@
-# cellar
+<h1 align="center">cellar</h1>
 
-This is how my home server backs itself up off the box. Every night restic takes an encrypted, deduplicated snapshot
-and sends it to a Backblaze B2 bucket through B2's S3-compatible API. It runs on the server alone, with no laptop
-that has to be awake. Once a week it checks the repository, and once a month it restores a few files to prove the
-backups can be read.
+<p align="center">Encrypted off-box backups for a home server, with restic and Backblaze B2.</p>
 
-Everything here is generic. The machine-specific parts (paths, bucket, keys, the repository password) live in
-`/etc/cellar/` on the server and never go in this repo. Each config file has an example in `etc/`.
+<p align="center">
+  <img src="https://img.shields.io/badge/restic-0.18-2C3E50" alt="restic">
+  <img src="https://img.shields.io/badge/Python-3%20stdlib-3776AB?logo=python&logoColor=white" alt="Python, standard library only">
+  <img src="https://img.shields.io/badge/systemd-timers-30D475" alt="systemd timers">
+</p>
+
+cellar backs a single Linux server up to Backblaze B2 without any other machine involved. restic takes encrypted,
+deduplicated snapshots and sends them through B2's S3-compatible API. Live SQLite databases are copied consistently,
+Minecraft servers pause auto-save for the duration, every week the repository is checked, and every month a restore
+drill proves the backups can actually be read.
+
+The repo is generic. Machine-specific settings (paths, bucket, keys, the repository password) live in `/etc/cellar/`
+on the server and never enter the repo; each config file has an example in `etc/`.
+
+```mermaid
+flowchart LR
+  db[("Live SQLite<br/>databases")] -- "backup API,<br/>integrity_check" --> stage["/var/lib/cellar/staging"]
+  mc["Minecraft servers"] -- "RCON save-off,<br/>save-all flush" --> paths
+  stage --> restic["restic backup"]
+  paths["sources.txt paths"] --> restic
+  restic -- "S3 API, encrypted" --> b2[("Backblaze B2<br/>versioned bucket")]
+  restic --> status["status.json"]
+  status --> hearth["Hearth dashboard"]
+  restic -. "ping" .-> hc["healthchecks.io"]
+```
 
 ## What's in it
 
-- `bin/cellar` is a single Python script (standard library only) that wraps restic. It has these subcommands:
-  `backup`, `check`, `drill`, `status`, `snapshots`, `sources`, `restore`, `init`, and `restic` (runs restic with the
-  credentials loaded).
-- `systemd/` has a oneshot service and a timer for each job. The backup runs at 04:30, the check on Sundays at
-  05:30 and the drill on the 1st of the month at 06:00, all Mountain time. They run at low CPU and idle IO priority
-  so the game servers on the same box don't notice.
+- `bin/cellar`, a single Python script (standard library only) that wraps restic. Subcommands: `backup`, `check`,
+  `drill`, `status`, `snapshots`, `sources`, `restore`, `init`, and `restic` (runs restic with the credentials loaded).
+- `systemd/`, a oneshot service and timer per job, all at low CPU and idle IO priority so the game servers on the
+  same machine aren't affected:
+
+  | Timer | When | What |
+  |---|---|---|
+  | `cellar-frequent` | every 30 minutes | short-term restore points, kept for 24 hours |
+  | `cellar-backup` | 04:30 nightly | the main backup, then retention and prune |
+  | `cellar-check` | Sundays 05:30 | `restic check` on a 10% data subset |
+  | `cellar-drill` | 1st of the month, 06:00 | restores a few files and verifies them |
+
 - `install.sh` installs the script and units, creates `/etc/cellar` from the examples, generates the repository
-  password, runs `restic init` if the repository doesn't exist yet, enables the timers and runs a self-test. It's
-  safe to run again after changes.
-- `RESTORE.md` is the step-by-step for getting everything back onto a rebuilt server.
+  password, runs `restic init` if needed, enables the timers and runs a self-test. It's safe to re-run.
+- `RESTORE.md`, the step-by-step for bringing everything back onto a rebuilt server.
+
+## How a backup runs
+
+1. Each database in `sqlite.txt` is copied with SQLite's backup API into `/var/lib/cellar/staging/<same path>`. The
+   copy runs as the database's owner, so SQLite never leaves root-owned `-wal`/`-shm` files next to the live
+   database, and each copy has to pass `PRAGMA integrity_check`. The live files are excluded and the staged copies
+   are backed up in their place.
+2. Each running Minecraft server gets `save-off` and `save-all flush` over RCON, and `save-on` afterwards. That
+   happens in a `finally` block that also runs when systemd stops the job, so a failed run can't leave auto-save off.
+3. `restic backup --tag <tag>`. Frequent snapshots are forgotten after 24 hours. Every other run then applies
+   `forget --group-by host,tags --keep-daily 7 --keep-weekly 5 --keep-monthly 12 --prune`. Grouping by tag keeps
+   `manual` and `pre-change` snapshots on their own retention so they never push nightly ones out.
+4. `/var/lib/cellar/status.json` is written and healthchecks.io is pinged if `HC_URL` is set.
+
+restic exit code 3 means some files couldn't be read but a snapshot was still saved. That's recorded as `partial`
+rather than `failed`.
 
 ## Config (`/etc/cellar/`, root only)
 
 | File | What |
 |---|---|
-| `b2.env` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `RESTIC_REPOSITORY=s3:https://<endpoint>/<bucket>`. I write it by hand. |
-| `restic.pass` | Repository password, generated by `install.sh`. Also kept in my password manager. |
+| `b2.env` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `RESTIC_REPOSITORY=s3:https://<endpoint>/<bucket>`. Written by hand. |
+| `restic.pass` | Repository password, generated by `install.sh`. Keep a copy off the server. |
 | `cellar.env` | `MINECRAFT` (unit:rcon-command pairs to pause auto-save on) and an optional `HC_URL` for healthchecks.io. |
 | `sources.txt` | Paths to back up, globs allowed. |
 | `excludes.txt` | restic exclude patterns. |
 | `sqlite.txt` | Live SQLite databases to copy with the backup API before each run. |
 | `drill.txt` | Files the monthly drill restores and checks. |
 
-## How a backup runs
+## Everyday commands
 
-1. Each database in `sqlite.txt` is copied with SQLite's backup API into `/var/lib/cellar/staging/<same path>`. The
-   copy runs as the database's owner, so SQLite never leaves root-owned `-wal`/`-shm` files next to the live
-   database, and each copy has to pass `PRAGMA integrity_check`. The live files are excluded and the staged
-   copies get backed up in their place.
-2. For each running Minecraft server it sends `save-off` and `save-all flush` over RCON, and `save-on` again
-   afterwards. That happens in a `finally` block that also runs when systemd stops the job, so a failed run can't
-   leave auto-save off.
-3. `restic backup --tag nightly`, then `restic forget --group-by host,tags --keep-daily 7 --keep-weekly 5
-   --keep-monthly 12 --prune`. Grouping by tag means `manual` and `pre-change` snapshots get their own retention
-   and don't push nightly ones out.
-4. It writes `/var/lib/cellar/status.json` and pings healthchecks.io if `HC_URL` is set.
+```bash
+sudo cellar status                 # last backup, check, drill, repo size, size per source
+sudo cellar snapshots
+sudo cellar sources                # which sources.txt lines exist
+sudo cellar backup --tag pre-change
+sudo cellar restic ls latest /etc/caddy
+sudo cellar restore latest --target /tmp/r --include /srv/minecraft/world
+journalctl -u cellar-backup -n 50
+systemctl list-timers 'cellar-*'
+```
 
-restic exit code 3 means that some files couldn't be read but a snapshot was still saved. That's recorded as
-`partial` instead of `failed`.
+`cellar status` prints a one-screen summary:
 
-Run one by hand with `sudo cellar backup` (tagged `manual`) or `sudo cellar backup --tag pre-change`.
+```
+backup  ok       2026-10-26T18:16:29+00:00
+check   ok       2026-10-25T11:37:41+00:00
+drill   ok       2026-10-01T12:01:24+00:00
+repo    338 snapshots, 9.33 GB
+       137.4 MB  /etc
+       615.2 MB  /var/lib/cellar/staging
+      1751.9 MB  /srv/minecraft
+       238.9 MB  /srv/valheim
+```
 
 ## status.json
 
-`/var/lib/cellar/status.json` is world-readable and holds no secrets. Hearth, my server dashboard, reads it. The
-top level is `schema` (currently `1`), `updated`, and these sections. Each one is only present after that job has
+`/var/lib/cellar/status.json` is world-readable and holds no secrets; [Hearth](https://github.com/anthonyradke/hearth)
+reads it. The top level is `schema` (currently `1`), `updated`, and these sections, each present once that job has
 run at least once:
 
 ```jsonc
@@ -85,29 +133,28 @@ run at least once:
 
 Adding fields is fine. Renaming or removing one means bumping `schema` and updating Hearth.
 
-## Everyday commands
+## Setup
 
-```bash
-sudo cellar status                 # last backup, check, drill, repo size, size per source
-sudo cellar snapshots
-sudo cellar sources                # which sources.txt lines exist
-sudo cellar backup --tag pre-change
-sudo cellar restic ls latest /etc/caddy
-sudo cellar restore latest --target /tmp/r --include /home/me/minecraft/world
-journalctl -u cellar-backup -n 50
-systemctl list-timers 'cellar-*'
-```
-
-## Setting it up
-
-1. Create a private B2 bucket and set its lifecycle to keep prior versions for 30 days, so a compromised server
-   can't wipe the backups for good right away. Make an application key that's restricted to that bucket, with read
-   and write. Under Caps & Alerts, raise the daily download cap above the free 1 GB (a dollar a day is plenty; you
-   only pay for what's used). When the cap is hit, B2 refuses every read, including the ones a nightly backup needs,
-   and a full restore is bigger than 1 GB.
+1. Create a private B2 bucket with a lifecycle rule that keeps prior versions for 30 days, so a compromised server
+   can't destroy the backups immediately. Create an application key restricted to that bucket, with read and write.
+   Under Caps & Alerts, raise the daily download cap above the free 1 GB: when a cap is hit B2 refuses every read,
+   including the ones a nightly backup needs, and a full restore is larger than 1 GB.
 2. `sudo install -d -m 700 /etc/cellar && sudo nano /etc/cellar/b2.env` (see `etc/b2.env.example`), then
    `sudo chmod 600 /etc/cellar/b2.env`.
-3. `sudo ./install.sh`. It creates the other config files from the examples, which then need editing for the
+3. `sudo ./install.sh`. It creates the remaining config files from the examples, which then need editing for the
    machine. Run it again after editing.
-4. Save `/etc/cellar/restic.pass`, the B2 key and the bucket name somewhere that isn't the server. Without the
+4. Store `/etc/cellar/restic.pass`, the B2 key and the bucket name somewhere other than the server. Without the
    password the backups can't be read.
+
+## Known limitations
+
+- One server, one repository. There's no second destination, so B2 is the only off-site copy.
+- Restores are manual (`cellar restore` and `RESTORE.md`); nothing rebuilds a machine automatically.
+- There's no unit test suite. The monthly drill is the end-to-end test: it restores real files from the latest
+  snapshot and checks their hashes and, for databases, their integrity.
+- Valheim has no save hook, so its world files are copied while the server runs; `RESTORE.md` explains how to fall back
+  to the game's own automatic backups if a live copy is inconsistent.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
