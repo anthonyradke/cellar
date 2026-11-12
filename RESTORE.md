@@ -62,7 +62,7 @@ owners by UID, which only matches if the user was recreated with the same UID).
 - **Minecraft:** copy the whole server directory back. `libraries/`, `versions/` and `logs/` weren't backed up; the
   server re-creates the first two on start. The world was saved with `save-all flush` before the snapshot, so it's
   consistent.
-- **Valheim:** copy `.config/unity3d/IronGate/Valheim/` back. The game itself (`~/valheim`) isn't backed up; install
+- **Valheim:** copy `.config/unity3d/IronGate/Valheim/` back. The game itself (`~/servers/valheim`) isn't backed up; install
   it again with steamcmd. The world has no save-off hook, so if the live `worlds_local/<world>/_main.<N>.*` set
   looks broken or the server refuses it, use the newest `<world>_backup_auto-<timestamp>/` folder next to it
   instead. Those are always complete.
