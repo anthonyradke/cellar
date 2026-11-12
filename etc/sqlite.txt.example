@@ -1,3 +1,6 @@
 # /etc/cellar/sqlite.txt: live SQLite databases. Each is copied with SQLite's backup API into
 # /var/lib/cellar/staging<same path> before the backup, and that copy is what gets backed up.
+# Prefix a line with "nightly " to copy that database only in nightly and manual runs; half-hourly runs then
+# keep the last copy. Worth it for a large database that changes all the time.
 /home/you/projects/app/data/app.db
+nightly /home/you/.local/share/bigapp/state.sqlite

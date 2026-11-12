@@ -1,7 +1,7 @@
 # Restoring from cellar
 
 These are the steps for getting everything back onto a freshly installed server. The same commands work for pulling
-back a single file on a live box. Paths below use `/home/me`; put in the real home directory.
+back a single file on a live box. Paths below use `/home/you`; put in the real home directory.
 
 ## What you need from outside the server
 
@@ -19,7 +19,7 @@ Do this right after the OS, SSH and sudo are set up, before rebuilding anything 
 unit files, config and notes that the rest of the rebuild depends on.
 
 ```bash
-sudo apt install restic
+sudo apt update && sudo apt install restic
 sudo install -d -m 700 /etc/cellar
 sudo nano /etc/cellar/b2.env          # AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, RESTIC_REPOSITORY
 sudo nano /etc/cellar/restic.pass     # the password, on one line
@@ -51,7 +51,7 @@ To restore from an older snapshot, use `restic snapshots` to pick an ID and use 
 Stop each service before putting its data back, and fix ownership afterwards (restic restores the original
 owners by UID, which only matches if the user was recreated with the same UID).
 
-- **Notes first:** the notes files in `/root/restore/home/me` and `projects/*/` have the full rebuild
+- **Notes first:** the notes files in `/root/restore/home/you` and `projects/*/` have the full rebuild
   guide. Copy them back and follow the rebuild order from there.
 - **Config from `/etc`:** copy over what each service needs, one directory at a time, for example
   `systemd/system/*.service`, `sudoers.d/`, `pihole/`, `dnsmasq.d/`, `caddy/`, `selkies/`, and the
@@ -68,7 +68,7 @@ owners by UID, which only matches if the user was recreated with the same UID).
   instead. Those are always complete.
 - **SQLite databases:** the live files weren't backed up. Their clean copies are at
   `/root/restore/var/lib/cellar/staging/<original path>`. Stop the app, copy the copy to the original path, give it
-  back to its owner (`chown me:me`), and delete any leftover `-wal`/`-shm` next to it before starting again.
+  back to its owner (`chown you:you`), and delete any leftover `-wal`/`-shm` next to it before starting again.
 
 ## 4. What isn't in the backup
 
@@ -95,7 +95,7 @@ enables the timers and runs its self-test. Restore `/etc/cellar/sources.txt` and
 ## Restoring one thing on a live box
 
 ```bash
-sudo cellar restic ls latest /home/me/minecraft/world | head
-sudo cellar restore latest --target /tmp/r --include /home/me/minecraft/world
+sudo cellar restic ls latest /home/you/minecraft/world | head
+sudo cellar restore latest --target /var/tmp/r --include /home/you/minecraft/world
 sudo cellar restic find level.dat     # which snapshots have a file
 ```

@@ -6,6 +6,8 @@ After=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/cellar drill
+# Records the run as failed if it was killed (OOM, timeout) before it could write its result.
+ExecStopPost=/usr/local/bin/cellar stopped drill
 # Stay out of the way of the game servers.
 Nice=10
 CPUSchedulingPolicy=batch
@@ -13,3 +15,10 @@ IOSchedulingClass=idle
 CacheDirectory=cellar
 CacheDirectoryMode=0700
 TimeoutStartSec=1h
+# cellar writes only to /var/lib/cellar, /var/cache/cellar and the bucket.
+ProtectSystem=full
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes

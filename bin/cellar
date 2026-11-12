@@ -1,16 +1,17 @@
 #!/usr/bin/python3
-"""cellar: nightly restic backups to an S3-compatible bucket, with checks and restore drills.
+"""cellar: restic backups to an S3-compatible bucket, with checks and restore drills.
 
 Usage:
   cellar backup [--tag TAG]     back up everything in sources.txt (default tag: manual)
-  cellar check [--subset 10%]   verify the repository and a random slice of its data
+  cellar check [--subset N/52]  verify the repository and a slice of its data (default: this ISO week's slice)
   cellar drill                  restore the files in drill.txt to a temp dir and check them
-  cellar status                 show the last results (from /var/lib/cellar/status.json)
+  cellar status [--json]        show the last results (from /var/lib/cellar/status.json)
   cellar snapshots              list snapshots
   cellar sources                show which source paths exist and which are missing
   cellar restore SNAPSHOT --target DIR [--include PATTERN ...]
   cellar restic ARGS...         run restic with cellar's credentials
   cellar init                   create the repository if it doesn't exist yet
+  cellar stopped JOB            for the units' ExecStopPost: records a run that was killed
 
 Settings live in /etc/cellar (see etc/*.example in the repo). Needs root.
 """
@@ -23,21 +24,28 @@ import hashlib
 import json
 import os
 import pwd
+import re
 import shutil
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.parse
 import urllib.request
 
 ETC = "/etc/cellar"
 STATE = "/var/lib/cellar"
 STATUS = f"{STATE}/status.json"
+STATUS_LOCK = f"{STATE}/status.lock"
+LOCK = f"{STATE}/lock"
 STAGING = f"{STATE}/staging"
 WORK = f"{STATE}/work"
+# restic's temporary pack files. Kept on disk because /tmp is often RAM (tmpfs).
+TMP = f"{STATE}/tmp"
 CACHE = "/var/cache/cellar"
-LOCK = "/run/lock/cellar.lock"
 SCHEMA = 1
 
 KEEP = ["--keep-daily", "7", "--keep-weekly", "5", "--keep-monthly", "12"]
@@ -45,24 +53,60 @@ KEEP = ["--keep-daily", "7", "--keep-weekly", "5", "--keep-monthly", "12"]
 # of KEEP so they never crowd out the dailies, and only pruned by the nightly run.
 FREQUENT = "frequent"
 KEEP_FREQUENT = ["--keep-within", "24h"]
+# Snapshots are grouped by host and tag, never by path list, so a change to what sources.txt
+# matches doesn't start a new retention group or force a full rescan.
+FORGET_GROUP = ["--group-by", "host,tags"]
+PARENT_GROUP = ["--group-by", "host"]
+# Repacking during prune downloads data, and B2's daily download cap blocks every read once it's
+# hit. This bounds what one nightly prune can download; the rest is repacked on later nights.
+DEFAULT_MAX_REPACK = "300M"
+RCON_TIMEOUT = 120
+SAVE_ON_TIMEOUT = 20
 
 # Copies a live SQLite database with the backup API and checks the copy. Runs as the
 # database's owner so SQLite never creates root-owned -wal/-shm files next to the original.
 SQLITE_COPY = """
-import sqlite3, sys
-src = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+import sqlite3, sys, urllib.parse
+src = sqlite3.connect("file:" + urllib.parse.quote(sys.argv[1]) + "?mode=ro", uri=True)
 dst = sqlite3.connect(sys.argv[2])
 src.backup(dst)
 result = dst.execute("pragma integrity_check").fetchone()[0]
+tables = dst.execute("select count(*) from sqlite_master").fetchone()[0]
 dst.close()
 src.close()
 if result != "ok":
     sys.exit(f"integrity_check failed: {result}")
+if not tables:
+    sys.exit("the copy has no tables")
 """
 
 
 class Failed(Exception):
     pass
+
+
+class Stopped(BaseException):
+    """SIGTERM from systemd. A BaseException, so cleanup code that catches Exception doesn't swallow it."""
+
+
+class Busy(Exception):
+    """Another cellar job holds the lock."""
+
+
+class Problems:
+    """Things that went wrong without losing the snapshot. alert means someone should look now."""
+
+    def __init__(self):
+        self.items = []
+        self.alert = False
+
+    def add(self, msg, alert=False):
+        log(f"WARNING: {msg}")
+        self.items.append(msg)
+        self.alert = self.alert or alert
+
+    def __str__(self):
+        return "; ".join(self.items)
 
 
 def now():
@@ -71,6 +115,15 @@ def now():
 
 def log(msg):
     print(msg, flush=True)
+
+
+def env_value(raw):
+    """A value from a KEY=value line: one pair of matching quotes, or an unquoted value ending at ' #'."""
+    raw = raw.strip()
+    if raw[:1] in ("'", '"'):
+        end = raw.find(raw[0], 1)
+        return raw[1:end] if end != -1 else raw[1:]
+    return re.split(r"\s+#", raw, maxsplit=1)[0].strip()
 
 
 def read_env(path):
@@ -83,7 +136,10 @@ def read_env(path):
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, value = line.split("=", 1)
-            env[key.strip()] = value.strip().strip("'\"")
+            key = key.strip()
+            if key.startswith("export "):
+                key = key[len("export "):].strip()
+            env[key] = env_value(value)
     return env
 
 
@@ -105,12 +161,20 @@ def restic_env():
     env = dict(os.environ, **b2)
     env["RESTIC_PASSWORD_FILE"] = f"{ETC}/restic.pass"
     env.setdefault("RESTIC_CACHE_DIR", CACHE)
+    os.makedirs(TMP, mode=0o700, exist_ok=True)
+    env["TMPDIR"] = TMP
     return env
 
 
-def restic(*args, ok=(0,), quiet=False):
-    """Run restic, echo its stderr, return (exit code, stdout). Raises unless the code is in ok."""
+def restic(*args, ok=(0,), quiet=False, capture=True):
+    """Run restic, echo its stderr, return (exit code, stdout). Raises unless the code is in ok.
+    With capture=False restic writes straight to the terminal (progress for long restores)."""
     cmd = ["restic", "--retry-lock", "30m", *args]
+    if not capture:
+        p = subprocess.run(cmd, env=restic_env())
+        if p.returncode not in ok:
+            raise Failed(f"restic {args[0]}: exit code {p.returncode}")
+        return p.returncode, ""
     p = subprocess.run(cmd, env=restic_env(), text=True, capture_output=True)
     if p.stderr and not quiet:
         sys.stderr.write(p.stderr)
@@ -124,26 +188,97 @@ def restic_json(*args):
     return json.loads(restic("--json", *args)[1])
 
 
-def status_merge(**sections):
+def json_lines(out):
+    """restic --json output, one message per line; anything that isn't JSON is skipped."""
+    for line in out.splitlines():
+        if line.startswith("{"):
+            try:
+                yield json.loads(line)
+            except ValueError:
+                continue
+
+
+@contextlib.contextmanager
+def flocked(path, wait=True):
+    """An exclusive flock on path. With wait=False, raises Busy instead of waiting."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        except BlockingIOError:
+            raise Busy(path) from None
+        yield
+    finally:
+        os.close(fd)
+
+
+def locked(wait=True):
+    """The job lock: one backup, check or drill at a time."""
+    return flocked(LOCK, wait)
+
+
+def lock_held():
+    try:
+        with locked(wait=False):
+            return False
+    except Busy:
+        return True
+
+
+def load_status():
     try:
         with open(STATUS) as f:
-            data = json.load(f)
-    except (OSError, ValueError):
-        data = {}
-    data.update(sections)
-    data["schema"] = SCHEMA
-    data["updated"] = now()
-    tmp = STATUS + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
-    os.chmod(tmp, 0o644)
-    os.replace(tmp, STATUS)
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def status_merge(**sections):
+    """Merge sections into status.json. Serialized with its own lock, written atomically."""
+    with flocked(STATUS_LOCK):
+        try:
+            data = load_status()
+        except ValueError:
+            # Shouldn't happen now that writes are atomic; keep the evidence instead of merging into it.
+            log(f"WARNING: {STATUS} was unreadable; moved it to {STATUS}.bad")
+            os.replace(STATUS, STATUS + ".bad")
+            data = {}
+        data.update(sections)
+        data["schema"] = SCHEMA
+        data["updated"] = now()
+        fd, tmp = tempfile.mkstemp(dir=STATE, prefix=".status-")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, STATUS)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
     return data
 
 
-def healthcheck(suffix="", body=""):
-    url = CONF.get("HC_URL")
+def healthcheck(job, suffix="", body=""):
+    """Ping healthchecks.io for job (nightly, frequent, manual, check or drill).
+
+    The nightly backup uses HC_URL; frequent, check and drill use HC_URL_FREQUENT, HC_URL_CHECK and
+    HC_URL_DRILL when set. Without their own URL their failures still go to HC_URL as /fail, so
+    nothing fails silently, but their successes never mark a failed nightly as fine.
+    Manual runs don't ping: whoever ran them saw the result.
+    """
+    if job == "nightly":
+        url = CONF.get("HC_URL")
+    elif job == "manual":
+        url = None
+    else:
+        url = CONF.get(f"HC_URL_{job.upper()}")
+        if not url and suffix == "/fail":
+            url = CONF.get("HC_URL")
     if not url:
         return
     try:
@@ -151,14 +286,6 @@ def healthcheck(suffix="", body=""):
         urllib.request.urlopen(req, timeout=10)
     except Exception as e:
         log(f"healthchecks ping failed: {e}")
-
-
-@contextlib.contextmanager
-def locked():
-    os.makedirs(os.path.dirname(LOCK), exist_ok=True)
-    with open(LOCK, "w") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        yield
 
 
 def sources():
@@ -174,16 +301,46 @@ def sources():
     return found, missing
 
 
-def stage():
-    """Fill the staging dir with consistent copies of live SQLite databases."""
-    shutil.rmtree(STAGING, ignore_errors=True)
-    os.makedirs(STAGING, mode=0o700)
-    os.makedirs(WORK, mode=0o755, exist_ok=True)
-    for src in read_list("sqlite.txt"):
-        if not os.path.exists(src):
+def copy_regular_file(src, dst):
+    """Copy src to a new root-only dst without following a symlink at src (src's dir isn't root's)."""
+    fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW)
+    with open(fd, "rb") as fin:
+        if not stat.S_ISREG(os.fstat(fin.fileno()).st_mode):
+            raise Failed(f"{src} isn't a regular file")
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(dst)
+        with open(os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as fout:
+            shutil.copyfileobj(fin, fout, 1 << 20)
+
+
+def sqlite_list():
+    """sqlite.txt lines: a path, or "nightly <path>" for a database only copied by nightly and manual runs."""
+    out = []
+    for line in read_list("sqlite.txt"):
+        nightly_only = line.startswith("nightly ")
+        out.append((line[len("nightly "):].strip() if nightly_only else line, nightly_only))
+    return out
+
+
+def stage(frequent=False):
+    """Fill the staging dir with consistent copies of live SQLite databases.
+
+    Frequent runs keep the last copy of a "nightly" database instead of copying it again: a large,
+    busy database would otherwise add most of its size to every half-hourly snapshot.
+    """
+    if not frequent:
+        shutil.rmtree(STAGING, ignore_errors=True)
+    shutil.rmtree(WORK, ignore_errors=True)
+    os.makedirs(STAGING, mode=0o700, exist_ok=True)
+    os.makedirs(WORK, mode=0o755)
+    for src, nightly_only in sqlite_list():
+        if not os.path.isfile(src):
             raise Failed(f"sqlite.txt lists {src}, which doesn't exist")
-        owner = pwd.getpwuid(os.stat(src).st_uid)
         dst = STAGING + src
+        if frequent and nightly_only and os.path.isfile(dst):
+            log(f"kept the last copy of {src}")
+            continue
+        owner = pwd.getpwuid(os.stat(src).st_uid)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         with tempfile.TemporaryDirectory(dir=WORK) as tmp:
             os.chown(tmp, owner.pw_uid, owner.pw_gid)
@@ -192,39 +349,70 @@ def stage():
                                text=True, capture_output=True)
             if p.returncode != 0:
                 raise Failed(f"copying {src}: {p.stderr.strip()}")
-            shutil.move(out, dst)
-            os.chown(dst, 0, 0)
-            os.chmod(dst, 0o600)
+            copy_regular_file(out, dst)
         log(f"staged {src} ({os.path.getsize(dst)} bytes)")
 
 
-def rcon(cmd, *args):
-    p = subprocess.run([cmd, *args], text=True, capture_output=True, timeout=120)
+def rcon(cmd, *args, timeout=RCON_TIMEOUT):
+    try:
+        p = subprocess.run([cmd, *args], text=True, capture_output=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise Failed(f"{cmd} {' '.join(args)}: {e}") from None
     if p.returncode != 0:
         raise Failed(f"{cmd} {' '.join(args)}: {(p.stderr or p.stdout).strip()}")
     return p.stdout.strip()
 
 
+def minecraft_servers():
+    servers = []
+    for pair in CONF.get("MINECRAFT", "").split():
+        unit, sep, cmd = pair.partition(":")
+        if not (sep and unit and cmd):
+            raise Failed(f"cellar.env: MINECRAFT entry {pair!r} isn't unit:command")
+        servers.append((unit, cmd))
+    return servers
+
+
 @contextlib.contextmanager
-def minecraft_paused():
-    """Turn off auto-save on running Minecraft servers while the backup reads their worlds."""
+def minecraft_paused(problems):
+    """Turn off auto-save on running Minecraft servers while the backup reads their worlds.
+
+    A server that can't be paused (RCON not up yet after a reboot) is backed up anyway and noted.
+    save-on runs with SIGTERM blocked, so a stop can't cut the loop short and leave a server
+    with auto-save off; a SIGTERM that arrives meanwhile is handled right after.
+    """
     paused = []
     try:
-        for pair in CONF.get("MINECRAFT", "").split():
-            unit, cmd = pair.split(":", 1)
+        for unit, cmd in minecraft_servers():
             if subprocess.run(["systemctl", "is-active", "--quiet", unit]).returncode != 0:
                 continue
-            rcon(cmd, "save-off")
-            paused.append(cmd)
-            log(f"{unit}: {rcon(cmd, 'save-all flush')}")
+            try:
+                rcon(cmd, "save-off")
+            except Failed as e:
+                problems.add(f"{unit}: couldn't pause auto-save, backed up while it was saving ({e})")
+                continue
+            paused.append((unit, cmd))
+            try:
+                log(f"{unit}: {rcon(cmd, 'save-all flush')}")
+            except Failed as e:
+                problems.add(f"{unit}: save-all flush failed, the world may be a few minutes old ({e})")
         yield
     finally:
-        for cmd in paused:
-            try:
-                rcon(cmd, "save-on")
-                log(f"{cmd}: save-on")
-            except Exception as e:
-                log(f"WARNING: {cmd} save-on failed, auto-save is still off: {e}")
+        old = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+        try:
+            for unit, cmd in paused:
+                for attempt in (1, 2):
+                    try:
+                        rcon(cmd, "save-on", timeout=SAVE_ON_TIMEOUT)
+                        log(f"{unit}: save-on")
+                        break
+                    except Failed as e:
+                        if attempt == 2:
+                            problems.add(f"{unit}: save-on failed, auto-save is still OFF ({e})", alert=True)
+                        else:
+                            time.sleep(5)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old)
 
 
 def source_sizes(snapshot, paths):
@@ -232,9 +420,8 @@ def source_sizes(snapshot, paths):
     sizes = {p: 0 for p in paths}
     _, out = restic("--json", "ls", snapshot)
     by_length = sorted(paths, key=len, reverse=True)
-    for line in out.splitlines():
-        node = json.loads(line)
-        if node.get("type") != "file":
+    for node in json_lines(out):
+        if node.get("type") != "file" or "path" not in node:
             continue
         for p in by_length:
             if node["path"] == p or node["path"].startswith(p.rstrip("/") + "/"):
@@ -249,30 +436,48 @@ def repo_stats():
     return {"snapshots": len(snaps), "size_bytes": raw.get("total_size", 0), "measured": now()}
 
 
+def prune_options():
+    size = CONF.get("PRUNE_MAX_REPACK", DEFAULT_MAX_REPACK)
+    return ["--max-repack-size", size] if size else []
+
+
+def backup_kind(tag):
+    return tag if tag in ("nightly", FREQUENT) else "manual"
+
+
 def cmd_backup(args):
-    started = now()
-    record = {"started": started, "finished": None, "result": "running", "error": None, "tag": args.tag}
-    status_merge(backup=record)
-    healthcheck("/start")
+    kind = backup_kind(args.tag)
     try:
-        with locked():
-            stage()
-            paths, missing = sources()
-            if not paths:
-                raise Failed("no source paths exist; check /etc/cellar/sources.txt")
-            for m in missing:
-                log(f"WARNING: source matched nothing: {m}")
-            exclude = ["--exclude-file", f"{ETC}/excludes.txt"] if os.path.exists(f"{ETC}/excludes.txt") else []
-            with minecraft_paused():
-                code, out = restic("--json", "backup", "--tag", args.tag, *exclude, *paths, ok=(0, 3))
-            summary = next((json.loads(l) for l in out.splitlines()
-                            if l.startswith("{") and json.loads(l).get("message_type") == "summary"), {})
-            restic("forget", "--tag", FREQUENT, *KEEP_FREQUENT)
-            if args.tag != FREQUENT:
-                restic("forget", "--group-by", "host,tags", *KEEP, "--keep-tag", FREQUENT, "--prune")
+        # A frequent run that finds another job running is redundant; skip it rather than queue.
+        with locked(wait=kind != FREQUENT):
+            run_backup(args.tag, kind)
+    except Busy:
+        log("another cellar job is running; skipping this frequent backup")
+
+
+def run_backup(tag, kind):
+    # Frequent runs have their own section so they can't hide a failed or missing nightly.
+    section = "frequent" if kind == FREQUENT else "backup"
+    record = {"started": now(), "finished": None, "result": "running", "error": None, "tag": tag}
+    if kind == FREQUENT:
+        with contextlib.suppress(ValueError):
+            record["last_success"] = (load_status().get(section) or {}).get("last_success")
+    status_merge(**{section: record})
+    healthcheck(kind, "/start")
+    problems = Problems()
+    try:
+        stage(frequent=kind == FREQUENT)
+        paths, missing = sources()
+        if not paths:
+            raise Failed(f"no source paths exist; check {ETC}/sources.txt")
+        for m in missing:
+            log(f"WARNING: source matched nothing: {m}")
+        exclude = ["--exclude-file", f"{ETC}/excludes.txt"] if os.path.exists(f"{ETC}/excludes.txt") else []
+        with minecraft_paused(problems):
+            code, out = restic("--json", "backup", *PARENT_GROUP, "--tag", tag, *exclude, *paths, ok=(0, 3))
+            # Recorded before the servers resume, so a stop during save-on still knows the snapshot.
+            summary = next((m for m in json_lines(out) if m.get("message_type") == "summary"), {})
             record.update(
-                result="ok" if code == 0 else "partial",
-                error=None if code == 0 else "some files could not be read (see journal); snapshot saved without them",
                 snapshot=summary.get("snapshot_id"),
                 bytes_added=summary.get("data_added"),
                 bytes_uploaded=summary.get("data_added_packed"),
@@ -281,33 +486,73 @@ def cmd_backup(args):
                 files_changed=summary.get("files_changed"),
                 files_total=summary.get("total_files_processed"),
                 missing_sources=missing,
-                finished=now(),
             )
-            extra = {"last_success": record["finished"], "repo": repo_stats()}
-            if record["snapshot"]:
-                extra["sources"] = source_sizes(record["snapshot"], paths)
-            status_merge(backup=record, **extra)
+        if code == 3:
+            problems.add("some files could not be read (see the journal); the snapshot was saved without them")
+        # The snapshot exists from here on. Record that first, so a failure in retention or
+        # stats below can't turn a saved backup into a "failed" one.
+        saved = now()
+        extra = {}
+        if kind == FREQUENT:
+            record["last_success"] = saved
+        else:
+            extra["last_success"] = saved
+        status_merge(**{section: record}, **extra)
+        try:
+            restic("forget", *FORGET_GROUP, "--tag", FREQUENT, *KEEP_FREQUENT)
+            if kind != FREQUENT:
+                restic("forget", *FORGET_GROUP, *KEEP, "--keep-tag", FREQUENT, "--prune", *prune_options())
+                extra["repo"] = repo_stats()
+                if record["snapshot"]:
+                    extra["sources"] = source_sizes(record["snapshot"], paths)
+        except Exception as e:
+            problems.add(f"snapshot saved, but retention or stats failed: {e}", alert=True)
+        record.update(result="partial" if problems.items else "ok", error=str(problems) or None, finished=now())
+        status_merge(**{section: record}, **extra)
     except BaseException as e:
-        record.update(result="failed", error=str(e) or type(e).__name__, finished=now())
-        status_merge(backup=record)
-        healthcheck("/fail", record["error"])
+        error = str(e) or type(e).__name__
+        if problems.items:
+            error += f"; {problems}"
+        record.update(result="partial" if record.get("snapshot") else "failed", error=error, finished=now())
+        status_merge(**{section: record})
+        healthcheck(kind, "/fail", error)
         raise
     log(f"backup {record['result']}: snapshot {record['snapshot']}, {record['bytes_added']} bytes added")
-    healthcheck("", json.dumps(record))
+    if problems.alert:
+        healthcheck(kind, "/fail", str(problems))
+    else:
+        healthcheck(kind, "", json.dumps(record))
+
+
+@contextlib.contextmanager
+def job(section, record):
+    """Status and healthchecks around a check or drill. The caller holds the job lock."""
+    status_merge(**{section: record})
+    healthcheck(section, "/start")
+    try:
+        yield
+    except BaseException as e:
+        record.update(result="failed", error=str(e) or type(e).__name__, finished=now())
+        status_merge(**{section: record})
+        healthcheck(section, "/fail", record["error"])
+        raise
+    record.update(result="ok", finished=now())
+    status_merge(**{section: record})
+    healthcheck(section, "", json.dumps(record))
+
+
+def weekly_subset(today=None):
+    """n/52 for this ISO week, so the weekly checks read every pack once a year."""
+    week = (today or datetime.date.today()).isocalendar().week
+    return f"{(week - 1) % 52 + 1}/52"
 
 
 def cmd_check(args):
-    record = {"started": now(), "finished": None, "result": "running", "error": None, "subset": args.subset}
-    status_merge(check=record)
-    try:
-        with locked():
-            restic("check", f"--read-data-subset={args.subset}")
-        record.update(result="ok", finished=now())
-    except BaseException as e:
-        record.update(result="failed", error=str(e) or type(e).__name__, finished=now())
-        raise
-    finally:
-        status_merge(check=record)
+    subset = args.subset or weekly_subset()
+    with locked():
+        record = {"started": now(), "finished": None, "result": "running", "error": None, "subset": subset}
+        with job("check", record):
+            restic("check", f"--read-data-subset={subset}")
     log("check ok")
 
 
@@ -319,66 +564,104 @@ def sha256(path):
     return h.hexdigest()
 
 
+def remove_leftovers():
+    """Temp dirs a killed run left behind (the SQLite work dir, restored drill files)."""
+    shutil.rmtree(WORK, ignore_errors=True)
+    for d in glob.glob(f"{STATE}/drill-*"):
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def cmd_drill(args):
-    record = {"started": now(), "finished": None, "result": "running", "error": None, "files": []}
-    status_merge(drill=record)
-    try:
-        patterns = read_list("drill.txt")
-        if not patterns:
-            raise Failed(f"{ETC}/drill.txt lists no files")
-        with locked(), tempfile.TemporaryDirectory(dir=STATE, prefix="drill-") as tmp:
-            record["snapshot"] = restic_json("snapshots", "latest")[0]["short_id"]
-            includes = [a for p in patterns for a in ("--include", p)]
-            # --verify re-reads every restored file and compares it with the snapshot.
-            restic("restore", record["snapshot"], "--target", tmp, "--verify", *includes)
-            problems = []
-            for pattern in patterns:
-                matches = sorted(glob.glob(tmp + pattern))
-                if not matches:
-                    problems.append(f"nothing restored for {pattern}")
-                for path in matches:
-                    entry = {"path": path[len(tmp):], "bytes": os.path.getsize(path), "sha256": sha256(path)}
-                    if entry["bytes"] == 0:
-                        problems.append(f"{entry['path']} is empty")
-                    if path.endswith((".db", ".sqlite")):
-                        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-                        entry["integrity"] = con.execute("pragma integrity_check").fetchone()[0]
-                        con.close()
-                        if entry["integrity"] != "ok":
-                            problems.append(f"{entry['path']}: integrity_check {entry['integrity']}")
-                    record["files"].append(entry)
-                    log(f"restored {entry['path']} ({entry['bytes']} bytes) {entry.get('integrity', '')}")
-            if problems:
-                raise Failed("; ".join(problems))
-        record.update(result="ok", finished=now())
-    except BaseException as e:
-        record.update(result="failed", error=str(e) or type(e).__name__, finished=now())
-        raise
-    finally:
-        status_merge(drill=record)
+    with locked():
+        remove_leftovers()
+        record = {"started": now(), "finished": None, "result": "running", "error": None, "files": []}
+        with job("drill", record):
+            drill(record)
     log("drill ok")
+
+
+def drill(record):
+    patterns = read_list("drill.txt")
+    if not patterns:
+        raise Failed(f"{ETC}/drill.txt lists no files")
+    with tempfile.TemporaryDirectory(dir=STATE, prefix="drill-") as tmp:
+        latest = restic_json("snapshots", "latest")
+        if not latest:
+            raise Failed("the repository has no snapshots")
+        record["snapshot"] = latest[0]["short_id"]
+        includes = [a for p in patterns for a in ("--include", p)]
+        # --verify re-reads every restored file and compares it with the snapshot.
+        restic("restore", record["snapshot"], "--target", tmp, "--verify", *includes)
+        problems = []
+        for pattern in patterns:
+            matches = sorted(glob.glob(tmp + pattern, include_hidden=True))
+            if not matches:
+                problems.append(f"nothing restored for {pattern}")
+            for path in matches:
+                entry = {"path": path[len(tmp):], "bytes": os.path.getsize(path), "sha256": sha256(path)}
+                if entry["bytes"] == 0:
+                    problems.append(f"{entry['path']} is empty")
+                if path.endswith((".db", ".sqlite", ".sqlite3")):
+                    con = sqlite3.connect("file:" + urllib.parse.quote(path) + "?mode=ro", uri=True)
+                    entry["integrity"] = con.execute("pragma integrity_check").fetchone()[0]
+                    con.close()
+                    if entry["integrity"] != "ok":
+                        problems.append(f"{entry['path']}: integrity_check {entry['integrity']}")
+                record["files"].append(entry)
+                log(f"restored {entry['path']} ({entry['bytes']} bytes) {entry.get('integrity', '')}")
+        if problems:
+            raise Failed("; ".join(problems))
+
+
+SECTIONS = {"nightly": "backup", FREQUENT: "frequent", "check": "check", "drill": "drill"}
+
+
+def cmd_stopped(args):
+    """ExecStopPost: if the job was killed (OOM, SIGKILL, timeout) before it could write its result,
+    mark it failed instead of leaving it "running" until the next run, and alert."""
+    result = os.environ.get("SERVICE_RESULT", "success")
+    if result == "success":
+        return
+    section = SECTIONS[args.job]
+    with contextlib.suppress(ValueError):
+        record = load_status().get(section) or {}
+        if record.get("result") != "running":
+            return
+        why = f"killed before it finished ({result}: {os.environ.get('EXIT_CODE', '?')} " \
+              f"{os.environ.get('EXIT_STATUS', '?')})"
+        record.update(result="failed", error=why, finished=now())
+        status_merge(**{section: record})
+        healthcheck(args.job, "/fail", why)
+        log(f"{section}: {why}")
+    if not lock_held():
+        remove_leftovers()
 
 
 def cmd_status(args):
     try:
-        with open(STATUS) as f:
-            data = json.load(f)
-    except OSError:
+        data = load_status()
+    except (OSError, ValueError) as e:
+        sys.exit(f"cellar: can't read {STATUS}: {e}")
+    if not data:
         sys.exit("no status yet: cellar hasn't run")
     if args.json:
         print(json.dumps(data, indent=2))
         return
-    for key in ("backup", "check", "drill"):
+    busy = lock_held()
+    for key in ("backup", "frequent", "check", "drill"):
         s = data.get(key) or {}
-        line = f"{key:7} {s.get('result', 'never'):8} {s.get('finished') or s.get('started') or ''}"
+        result = s.get("result", "never")
+        if result == "running" and not busy:
+            result = "interrupted"
+        line = f"{key:9} {result:11} {s.get('finished') or s.get('started') or ''}"
         if s.get("error"):
             line += f"  {s['error']}"
         print(line)
     repo = data.get("repo") or {}
     if repo:
-        print(f"repo    {repo['snapshots']} snapshots, {repo['size_bytes'] / 1e9:.2f} GB")
+        print(f"repo      {repo.get('snapshots', '?')} snapshots, {repo.get('size_bytes', 0) / 1e9:.2f} GB")
     for s in data.get("sources") or []:
-        print(f"  {s['bytes'] / 1e6:10.1f} MB  {s['path']}")
+        print(f"  {s.get('bytes', 0) / 1e6:10.1f} MB  {s.get('path')}")
 
 
 def cmd_sources(args):
@@ -397,7 +680,7 @@ def cmd_snapshots(args):
 
 def cmd_restore(args):
     includes = [a for p in args.include for a in ("--include", p)]
-    restic("restore", args.snapshot, "--target", args.target, *includes)
+    restic("restore", args.snapshot, "--target", args.target, *includes, capture=False)
     log(f"restored {args.snapshot} into {args.target}")
 
 
@@ -414,6 +697,10 @@ def cmd_init(args):
     log("repository created")
 
 
+def on_sigterm(*_):
+    raise Stopped("stopped by SIGTERM (systemctl stop, or the unit's start timeout ran out)")
+
+
 def main():
     parser = argparse.ArgumentParser(prog="cellar", description="restic backups for this machine")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -421,7 +708,7 @@ def main():
     p.add_argument("--tag", default="manual")
     p.set_defaults(func=cmd_backup)
     p = sub.add_parser("check")
-    p.add_argument("--subset", default="10%")
+    p.add_argument("--subset", help="restic --read-data-subset value (default: this ISO week's n/52)")
     p.set_defaults(func=cmd_check)
     sub.add_parser("drill").set_defaults(func=cmd_drill)
     p = sub.add_parser("status")
@@ -438,6 +725,9 @@ def main():
     p.add_argument("args", nargs=argparse.REMAINDER)
     p.set_defaults(func=cmd_restic)
     sub.add_parser("init").set_defaults(func=cmd_init)
+    p = sub.add_parser("stopped")
+    p.add_argument("job", choices=sorted(SECTIONS))
+    p.set_defaults(func=cmd_stopped)
     if sys.argv[1:2] == ["restic"]:
         args = argparse.Namespace(func=cmd_restic, args=sys.argv[2:])
     else:
@@ -446,11 +736,14 @@ def main():
     if os.geteuid() != 0:
         sys.exit("cellar: run as root (sudo cellar ...)")
     # systemd stops a unit with SIGTERM; turn it into an exception so cleanup (save-on) still runs.
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    signal.signal(signal.SIGTERM, on_sigterm)
     try:
         args.func(args)
     except Failed as e:
         sys.exit(f"cellar: {e}")
+    except Stopped as e:
+        print(f"cellar: {e}", file=sys.stderr)
+        sys.exit(143)
 
 
 if __name__ == "__main__":

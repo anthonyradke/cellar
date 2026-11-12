@@ -8,20 +8,23 @@ if [ "$(id -u)" != 0 ]; then
     exit 1
 fi
 
-command -v restic >/dev/null || apt-get install -y restic
+command -v restic >/dev/null || { apt-get update && apt-get install -y restic; }
 install -m 755 bin/cellar /usr/local/bin/cellar
 install -m 644 systemd/cellar-*.service systemd/cellar-*.timer /etc/systemd/system/
+systemctl daemon-reload
 install -d -m 700 /etc/cellar /var/cache/cellar
 install -d -m 755 /var/lib/cellar
 install -d -m 700 /var/lib/cellar/staging
 
 # Starter config from the examples, never overwriting real files. b2.env is written by hand.
+created=()
 for example in etc/*.example; do
     name=$(basename "$example" .example)
     [ "$name" = b2.env ] && continue
     if [ ! -e "/etc/cellar/$name" ]; then
         install -m 600 "$example" "/etc/cellar/$name"
         echo "created /etc/cellar/$name from the example; edit it for this machine"
+        created+=("/etc/cellar/$name")
     fi
 done
 
@@ -48,9 +51,16 @@ if [ ! -s /etc/cellar/restic.pass ]; then
     echo "Without it the backups can't be read."
 fi
 
+# Don't create the repository or start the timers while the config is still the examples:
+# every run would fail on their placeholder paths.
+if [ "${#created[@]}" -gt 0 ]; then
+    echo
+    echo "Edit ${created[*]} for this machine, then run sudo ./install.sh again."
+    exit 1
+fi
+
 cellar init
 
-systemctl daemon-reload
 systemctl enable --now cellar-frequent.timer cellar-backup.timer cellar-check.timer cellar-drill.timer
 
 echo
