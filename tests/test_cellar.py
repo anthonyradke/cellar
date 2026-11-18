@@ -304,6 +304,33 @@ class Minecraft(CellarTest):
             self.backup("nightly")
 
 
+class PreBackup(CellarTest):
+    def test_runs_before_restic_reads_the_sources(self):
+        marker = self.tmp / "pulled"
+        self.c.CONF["PRE_BACKUP"] = f"sh -c 'echo pulled; touch {marker}'"
+        self.backup("nightly")
+        self.assertTrue(marker.exists())
+        self.assertIn("PRE_BACKUP: pulled", self.logs)
+        self.assertEqual(self.status()["backup"]["result"], "ok")
+        self.assertEqual(self.pings[-1], "https://hc.invalid/nightly")
+
+    def test_failure_alerts_but_the_backup_still_runs(self):
+        self.c.CONF["PRE_BACKUP"] = "sh -c 'echo h5 unreachable >&2; exit 2'"
+        self.backup("frequent")
+        self.assertEqual(len(self.calls_for("backup")), 1)
+        s = self.status()["frequent"]
+        self.assertEqual(s["result"], "partial")
+        self.assertIn("PRE_BACKUP failed", s["error"])
+        self.assertIn("h5 unreachable", s["error"])
+        self.assertEqual(self.pings[-1], "https://hc.invalid/nightly/fail")
+
+    def test_missing_command_alerts(self):
+        self.c.CONF["PRE_BACKUP"] = str(self.tmp / "no-such-script")
+        self.backup("nightly")
+        self.assertIn("PRE_BACKUP failed", self.status()["backup"]["error"])
+        self.assertEqual(len(self.calls_for("backup")), 1)
+
+
 class Status(CellarTest):
     def test_concurrent_merges_lose_nothing(self):
         ctx = multiprocessing.get_context("fork")

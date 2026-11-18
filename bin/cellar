@@ -25,6 +25,7 @@ import json
 import os
 import pwd
 import re
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -62,6 +63,7 @@ PARENT_GROUP = ["--group-by", "host"]
 DEFAULT_MAX_REPACK = "300M"
 RCON_TIMEOUT = 120
 SAVE_ON_TIMEOUT = 20
+PRE_BACKUP_TIMEOUT = 1800
 
 # Copies a live SQLite database with the backup API and checks the copy. Runs as the
 # database's owner so SQLite never creates root-owned -wal/-shm files next to the original.
@@ -353,6 +355,28 @@ def stage(frequent=False):
         log(f"staged {src} ({os.path.getsize(dst)} bytes)")
 
 
+def pre_backup(problems):
+    """Run cellar.env's PRE_BACKUP command before restic reads the sources.
+
+    Meant for filling a source path from elsewhere, e.g. pulling a consistent copy of a game world
+    from another machine. A failure is alerted but doesn't stop the backup: everything else is still
+    saved, and the path keeps its last good copy.
+    """
+    cmd = CONF.get("PRE_BACKUP", "").strip()
+    if not cmd:
+        return
+    try:
+        p = subprocess.run(shlex.split(cmd), text=True, capture_output=True, timeout=PRE_BACKUP_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        problems.add(f"PRE_BACKUP failed, its paths hold the last good copy ({e})", alert=True)
+        return
+    for line in (p.stdout + p.stderr).splitlines():
+        log(f"PRE_BACKUP: {line}")
+    if p.returncode != 0:
+        last = (p.stderr or p.stdout).strip().splitlines()[-1:] or [f"exit {p.returncode}"]
+        problems.add(f"PRE_BACKUP failed, its paths hold the last good copy ({last[0]})", alert=True)
+
+
 def rcon(cmd, *args, timeout=RCON_TIMEOUT):
     try:
         p = subprocess.run([cmd, *args], text=True, capture_output=True, timeout=timeout)
@@ -467,6 +491,7 @@ def run_backup(tag, kind):
     problems = Problems()
     try:
         stage(frequent=kind == FREQUENT)
+        pre_backup(problems)
         paths, missing = sources()
         if not paths:
             raise Failed(f"no source paths exist; check {ETC}/sources.txt")
