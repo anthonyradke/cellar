@@ -27,12 +27,29 @@ run at least once. Every write takes `status.lock` and replaces the file atomica
   "check":   { "started": "…", "finished": "…", "result": "running | ok | failed", "error": null, "subset": "46/52" },
   "drill":   { "started": "…", "finished": "…", "result": "running | ok | failed", "error": null,
                "snapshot": "3f9c1a2b",
-               "files": [ { "path": "…", "bytes": 0, "sha256": "…", "integrity": "ok" } ] }  // integrity only for SQLite files
+               "full": false,                                                   // true for the local copy's whole-snapshot drill
+               "files": [ { "path": "…", "bytes": 0, "sha256": "…", "integrity": "ok" } ] },  // integrity only for SQLite files
+  "local": {                                    // only when a local copy is configured (docs/backup-host.md)
+    "updated": "…",
+    "last_success": "…",                        // the local copy's last nightly or manual snapshot
+    "backup":   { /* same fields as the top-level backup */ },
+    "frequent": { /* same fields as the top-level frequent */ },
+    "repo":     { "snapshots": 0, "size_bytes": 0, "measured": "…" },
+    "check":    { /* as above; subset is "all" */ },
+    "drill":    { /* as above, with "full": true and "restored": { "files": 0, "bytes": 0 } */ }
+  }
 }
 ```
 
+The top-level sections always describe the off-site repository, so readers written before the local copy existed
+see exactly what they saw before. `local` has the same section names with the same fields, one level down, and has
+no `sources` (sizes per source are measured off-site only). A reader that wants to show the local copy reads
+`local.backup`, `local.frequent`, `local.check`, `local.drill`, `local.repo` and `local.last_success` with the same
+rules it uses for the top level; the local check is expected weekly and the drill monthly, like the off-site ones.
+
 `partial` means a snapshot was saved but something needs a look: files that couldn't be read, a Minecraft server
-that couldn't be paused or resumed, or retention and stats failing after the backup. `error` says which.
+that couldn't be paused or resumed, retention and stats failing after the backup, or (local copy only) a backup
+host whose prune has stopped. `error` says which.
 
 A run killed before it could write its result (OOM, SIGKILL, unit timeout) is set to `failed` by the unit's
 `ExecStopPost` (`cellar stopped <job>`), so `running` only lasts while a job really runs. `cellar status` also

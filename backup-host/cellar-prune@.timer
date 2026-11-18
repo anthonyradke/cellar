@@ -1,0 +1,11 @@
+[Unit]
+Description=Prune the %i cellar repository every day
+
+[Timer]
+# After the client's nightly backup (04:30) and weekly check (Sun 05:30).
+OnCalendar=*-*-* 07:00 America/Denver
+Persistent=true
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

@@ -7,11 +7,14 @@ back a single file on a live box. Paths below use `/home/you`; put in the real h
 
 - The B2 key ID and application key, plus the bucket name and its S3 endpoint.
 - The restic repository password (`/etc/cellar/restic.pass` on the old box).
+- If there is a local copy ([docs/backup-host.md](docs/backup-host.md)): its password (`/etc/cellar/local.pass`).
+  The backup host keeps a copy of it in `/etc/cellar-server/<client>.pass`.
 
 If those are lost along with the server, the backups can't be read.
 
-Check the daily download cap in B2 (Caps & Alerts) first. A full restore is several GB, and once the cap is hit B2
-refuses every read until midnight UTC.
+**Restore from the local copy when it's there.** It runs at LAN speed and has no download cap. The bucket is for
+when the backup host is gone too. Check the daily download cap in B2 (Caps & Alerts) before restoring from it: a
+full restore is several GB, and once the cap is hit B2 refuses every read until midnight UTC.
 
 ## 1. Get restic talking to the repository
 
@@ -30,6 +33,22 @@ set -a; . /etc/cellar/b2.env; set +a
 export RESTIC_PASSWORD_FILE=/etc/cellar/restic.pass
 restic snapshots                      # should list the nightly snapshots
 ```
+
+From the local copy instead, reset the client's REST login on the backup host (`backup-host/install.sh ...
+--password-stdin`, see docs/backup-host.md) and use these in place of `b2.env` and `restic.pass`:
+
+```bash
+sudo nano /etc/cellar/local.env       # RESTIC_REPOSITORY=rest:http://<backup-host>:<port>/<client>/, REST user and password
+sudo nano /etc/cellar/local.pass      # the local copy's password
+sudo chmod 600 /etc/cellar/*
+sudo -i
+set -a; . /etc/cellar/local.env; set +a
+export RESTIC_PASSWORD_FILE=/etc/cellar/local.pass
+restic snapshots
+```
+
+Or skip the network: on the backup host, `restic -r <data dir>/<client> --password-file
+/etc/cellar-server/<client>.pass restore latest --target <dir>`, then copy the result over with rsync.
 
 **Don't run `install.sh` yet.** It enables the nightly timer, and backing up a half-rebuilt box just adds useless
 snapshots. Do it last (step 5).
@@ -88,14 +107,16 @@ git clone https://github.com/anthonyradke/cellar ~/projects/cellar
 cd ~/projects/cellar && sudo ./install.sh
 ```
 
-`/etc/cellar/` already exists, so `install.sh` keeps the keys and password, sees that the repository exists,
+`/etc/cellar/` already exists, so `install.sh` keeps the keys and passwords, sees that the repositories exist,
 enables the timers and runs its self-test. Restore `/etc/cellar/sources.txt` and the other lists from
 `/root/restore/etc/cellar/` first if you want the old ones.
 
 ## Restoring one thing on a live box
 
+Add `--local` after `cellar` to read the local copy instead of the bucket.
+
 ```bash
-sudo cellar restic ls latest /home/you/minecraft/world | head
-sudo cellar restore latest --target /var/tmp/r --include /home/you/minecraft/world
-sudo cellar restic find level.dat     # which snapshots have a file
+sudo cellar --local restic ls latest /home/you/minecraft/world | head
+sudo cellar --local restore latest --target /var/tmp/r --include /home/you/minecraft/world
+sudo cellar restic find level.dat     # which off-site snapshots have a file
 ```

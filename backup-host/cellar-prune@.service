@@ -1,0 +1,49 @@
+[Unit]
+Description=cellar backup host: retention and prune for the %i repository
+Documentation=https://github.com/anthonyradke/cellar/blob/main/docs/backup-host.md
+# install.sh adds RequiresMountsFor=<data dir>.
+
+[Service]
+Type=oneshot
+User=restic-rest-server
+Group=restic-rest-server
+EnvironmentFile=/etc/cellar-server/server.env
+# The client's repository password, root-only on disk.
+LoadCredential=pass:/etc/cellar-server/%i.pass
+Environment=RESTIC_PASSWORD_FILE=%d/pass
+Environment=RESTIC_CACHE_DIR=%C/cellar-prune
+CacheDirectory=cellar-prune
+CacheDirectoryMode=0700
+# The same policy cellar applies to its off-site repository: frequent snapshots for 24 hours,
+# then 7 daily, 5 weekly and 12 monthly per host and tag set. No repack limit: reads are local.
+ExecStart=/usr/bin/restic -r ${CELLAR_DATA}/%i --retry-lock 2h forget --group-by host,tags --tag frequent --keep-within 24h
+ExecStart=/usr/bin/restic -r ${CELLAR_DATA}/%i --retry-lock 2h forget --group-by host,tags --keep-daily 7 --keep-weekly 5 --keep-monthly 12 --keep-tag frequent --prune
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=6h
+UMask=0077
+
+# Sandbox. install.sh adds ReadWritePaths=<data dir>. Pruning needs no network at all.
+PrivateNetwork=yes
+IPAddressDeny=any
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service

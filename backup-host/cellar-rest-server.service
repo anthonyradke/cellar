@@ -1,0 +1,55 @@
+[Unit]
+Description=cellar backup host: append-only restic REST server
+Documentation=https://github.com/anthonyradke/cellar/blob/main/docs/backup-host.md
+Wants=network-online.target
+After=network-online.target tailscaled.service
+# The listen address may not exist yet at boot (a VPN address, say); keep retrying.
+StartLimitIntervalSec=0
+# install.sh adds RequiresMountsFor=<data dir>, so a missing disk stops the server instead of
+# letting it write into the empty mount point.
+
+[Service]
+Type=simple
+User=restic-rest-server
+Group=restic-rest-server
+EnvironmentFile=/etc/cellar-server/server.env
+# The htpasswd file stays root-only on disk; systemd hands the service a private copy.
+LoadCredential=htpasswd:/etc/cellar-server/htpasswd
+# --append-only: clients can add data and snapshots but never delete or rewrite them (lock files
+# excepted). Retention runs here, in cellar-prune@.service. --private-repos: each login reaches only
+# <data dir>/<login>/.
+ExecStart=/usr/bin/restic-rest-server --path ${CELLAR_DATA} --listen ${CELLAR_LISTEN} --append-only --private-repos --htpasswd-file %d/htpasswd $CELLAR_ARGS
+Restart=always
+RestartSec=10
+UMask=0077
+
+# Sandbox. install.sh adds ReadWritePaths=<data dir> and IPAddressAllow=<each client>.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProcSubset=pid
+RemoveIPC=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+IPAddressDeny=any
+
+[Install]
+WantedBy=multi-user.target

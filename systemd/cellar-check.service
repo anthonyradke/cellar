@@ -15,7 +15,7 @@ IOSchedulingClass=idle
 CacheDirectory=cellar
 CacheDirectoryMode=0700
 TimeoutStartSec=6h
-# cellar writes only to /var/lib/cellar, /var/cache/cellar and the bucket.
+# cellar writes only to /var/lib/cellar, /var/cache/cellar and its repositories.
 ProtectSystem=full
 PrivateTmp=yes
 NoNewPrivileges=yes

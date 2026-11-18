@@ -20,7 +20,7 @@ install -d -m 700 /var/lib/cellar/staging
 created=()
 for example in etc/*.example; do
     name=$(basename "$example" .example)
-    [ "$name" = b2.env ] && continue
+    [ "$name" = b2.env ] || [ "$name" = local.env ] && continue
     if [ ! -e "/etc/cellar/$name" ]; then
         install -m 600 "$example" "/etc/cellar/$name"
         echo "created /etc/cellar/$name from the example; edit it for this machine"
@@ -61,6 +61,23 @@ fi
 
 cellar init
 
+# The local copy is optional: only when local.env exists (see docs/backup-host.md).
+local=0
+if [ -s /etc/cellar/local.env ]; then
+    local=1
+    chmod 600 /etc/cellar/local.env
+    if [ ! -s /etc/cellar/local.pass ]; then
+        (umask 077 && python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > /etc/cellar/local.pass)
+        echo
+        echo "Generated the local copy's repository password in /etc/cellar/local.pass."
+        echo "Save it in your password manager too (sudo cat /etc/cellar/local.pass), and copy it to the"
+        echo "backup host as /etc/cellar-server/<client>.pass so it can prune."
+    fi
+    chmod 600 /etc/cellar/local.pass
+    # A backup host that's down mustn't stop the off-site timers being enabled; the self-test reports it.
+    cellar --local init || echo "WARNING: couldn't set up the local copy; off-site backups are unaffected"
+fi
+
 systemctl enable --now cellar-frequent.timer cellar-backup.timer cellar-check.timer cellar-drill.timer
 
 echo
@@ -70,6 +87,9 @@ check() {
     if "$@" >/dev/null 2>&1; then echo "  ok    $desc"; else echo "  FAIL  $desc"; fail=1; fi
 }
 desc="repository reachable"; check cellar restic cat config
+if [ "$local" = 1 ]; then
+    desc="local copy reachable"; check cellar --local restic cat config
+fi
 desc="all sources exist";    check cellar sources
 for t in frequent backup check drill; do
     desc="cellar-$t.timer active"; check systemctl is-active --quiet "cellar-$t.timer"
