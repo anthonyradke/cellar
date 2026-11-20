@@ -37,6 +37,15 @@ run at least once. Every write takes `status.lock` and replaces the file atomica
     "repo":     { "snapshots": 0, "size_bytes": 0, "measured": "…" },
     "check":    { /* as above; subset is "all" */ },
     "drill":    { /* as above, with "full": true and "restored": { "files": 0, "bytes": 0 } */ }
+  },
+  "drift": {                                    // only with a local copy; nightly and manual runs and `cellar drift`
+    "measured": "…",
+    "result": "ok | drift",
+    "problems": [],                             // e.g. "nightly 2026-11-19: off-site only"
+    "off_site": { "snapshots": 0, "newest": "…" },   // nightly and manual snapshots (frequent ones left out)
+    "local":    { "snapshots": 0, "newest": "…" },
+    "gap_hours": 0.0,                           // between the two newest; drift above 12
+    "compared_since": "2026-11-15"              // first day compared (the last six days both copies cover in full)
   }
 }
 ```
@@ -46,6 +55,14 @@ see exactly what they saw before. `local` has the same section names with the sa
 no `sources` (sizes per source are measured off-site only). A reader that wants to show the local copy reads
 `local.backup`, `local.frequent`, `local.check`, `local.drill`, `local.repo` and `local.last_success` with the same
 rules it uses for the top level; the local check is expected weekly and the drill monthly, like the off-site ones.
+
+`drift` is measured after every nightly and manual run that wrote both repositories, and by `cellar drift`. Each
+day's last snapshot per host and tag is compared over the last six days, which stays inside `--keep-daily 7`, so
+the two sides' different prune times never show as a difference; frequent snapshots (off-site only) and the days
+before the local copy existed are left out. `drift` is informational: it never changes a run's `result` and isn't sent to healthchecks.io. It is not updated
+when either repository's backup failed, so it keeps the last measurement; `cellar status` adds a live comparison
+of `last_success` and `local.last_success` (drift when more than 12 hours apart). A reader showing it treats
+`result: "drift"` or that gap as a warning.
 
 `partial` means a snapshot was saved but something needs a look: files that couldn't be read, a Minecraft server
 that couldn't be paused or resumed, retention and stats failing after the backup, or (local copy only) a backup

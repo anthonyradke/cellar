@@ -664,7 +664,8 @@ class LocalCopy(CellarTest):
     def test_existing_status_keys_keep_their_shape(self):
         self.backup("nightly")
         s = self.status()
-        self.assertEqual(set(s) - {"local"}, {"schema", "updated", "last_success", "backup", "repo", "sources"})
+        self.assertEqual(set(s) - {"local", "drift"},
+                         {"schema", "updated", "last_success", "backup", "repo", "sources"})
         self.assertEqual(s["schema"], 1)
 
     def test_only_flag_picks_one_repository(self):
@@ -753,6 +754,157 @@ class LocalCopy(CellarTest):
         with contextlib.redirect_stdout(out):
             self.c.cmd_status(argparse.Namespace(json=False))
         self.assertRegex(out.getvalue(), r"local copy:\n  backup\s+ok")
+
+
+def snap(when, *tags, host="server"):
+    return {"short_id": when, "time": when, "hostname": host, "tags": list(tags)}
+
+
+def nightlies(*days):
+    return [snap(f"2026-11-{d:02d}T11:37:00Z", "nightly") for d in days]
+
+
+class Drift(CellarTest):
+    """Comparing the off-site repository's snapshots with the local copy's."""
+    TODAY = datetime.date(2026, 11, 20)
+
+    def drift(self, off_site, local):
+        return self.c.drift(off_site, local, today=self.TODAY)
+
+    def test_matching_copies_are_ok(self):
+        r = self.drift(nightlies(*range(1, 21)), nightlies(18, 19, 20))
+        self.assertEqual((r["result"], r["problems"]), ("ok", []))
+        self.assertEqual(r["gap_hours"], 0)
+        self.assertEqual(r["compared_since"], "2026-11-19")
+        self.assertEqual((r["off_site"]["snapshots"], r["local"]["snapshots"]), (20, 3))
+
+    def test_a_nightly_missing_from_the_local_copy_is_flagged(self):
+        r = self.drift(nightlies(*range(10, 21)), nightlies(10, 11, 12, 13, 14, 15, 17, 18, 19, 20))
+        self.assertEqual(r["result"], "drift")
+        self.assertEqual(r["problems"], ["nightly 2026-11-16: off-site only"])
+
+    def test_a_snapshot_only_in_the_local_copy_is_flagged(self):
+        local = nightlies(*range(10, 21)) + [snap("2026-11-19T02:00:00Z", "pre-change")]
+        r = self.drift(nightlies(*range(10, 21)), local)
+        self.assertEqual(r["problems"], ["pre-change 2026-11-19: local copy only"])
+
+    def test_holes_older_than_the_compared_days_are_ignored(self):
+        r = self.drift(nightlies(*range(1, 21)), nightlies(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17,
+                                                          18, 19, 20))
+        self.assertEqual(r["compared_since"], "2026-11-15")
+        self.assertEqual(r["result"], "ok")
+
+    def test_the_day_the_local_copy_started_isnt_a_hole(self):
+        off_site = nightlies(16, 17, 18, 19, 20) + [snap("2026-11-18T03:00:00Z", "migration")]
+        local = [snap("2026-11-18T04:14:00Z", "manual")] + nightlies(18, 19, 20)
+        r = self.drift(off_site, local)
+        self.assertEqual(r["problems"], [])
+
+    def test_prune_timing_doesnt_count(self):
+        # The backup host prunes after the nightly: until then it still has a second snapshot that day.
+        local = nightlies(*range(10, 21)) + [snap("2026-11-19T04:00:00Z", "nightly")]
+        self.assertEqual(self.drift(nightlies(*range(10, 21)), local)["problems"], [])
+
+    def test_frequent_snapshots_are_ignored(self):
+        off_site = nightlies(*range(10, 21)) + [snap(f"2026-11-20T{h:02d}:15:00Z", "frequent") for h in range(12, 20)]
+        self.assertEqual(self.drift(off_site, nightlies(*range(10, 21)))["result"], "ok")
+
+    def test_newest_snapshots_far_apart_are_flagged(self):
+        off_site = nightlies(*range(10, 21)) + [snap("2026-11-20T20:00:00Z", "manual")]
+        r = self.drift(off_site + [snap("2026-11-19T20:00:00Z", "manual")],
+                       nightlies(*range(10, 20)) + [snap("2026-11-19T20:00:00Z", "manual")])
+        self.assertEqual(r["gap_hours"], 24.0)
+        self.assertIn("the local copy's newest snapshot is 24 h older than the other's", r["problems"])
+        self.assertIn("nightly 2026-11-20: off-site only", r["problems"])
+
+    def test_an_empty_local_copy_is_flagged(self):
+        r = self.drift(nightlies(19, 20), [])
+        self.assertEqual(r["problems"], ["the local copy has no nightly or manual snapshots"])
+
+    def test_hosts_are_compared_separately(self):
+        off_site = nightlies(*range(10, 21)) + [snap("2026-11-19T11:00:00Z", "nightly", host="other")]
+        r = self.drift(off_site, nightlies(*range(10, 21)))
+        self.assertEqual(r["problems"], ["nightly 2026-11-19: off-site only"])
+
+    def test_status_line(self):
+        ok = self.drift(nightlies(*range(1, 21)), nightlies(18, 19, 20))
+        self.assertRegex(self.c.drift_line(ok), r"^drift\s+ok\s+\S+  newest 0 h apart, every day since 2026-11-19")
+        self.assertRegex(self.c.drift_line(ok, ["late"]), r"^drift\s+drift\s+\S+  late$")
+        self.assertRegex(self.c.drift_line({}), r"^drift\s+never")
+
+    def test_last_success_gap(self):
+        data = {"last_success": "2026-11-20T11:40:00+00:00", "local": {"last_success": "2026-11-18T11:40:00+00:00"}}
+        self.assertEqual(self.c.last_success_gap(data),
+                         "the local copy's last successful backup is 48 h older than the other's")
+        data["local"]["last_success"] = "2026-11-20T11:41:00+00:00"
+        self.assertIsNone(self.c.last_success_gap(data))
+        self.assertIsNone(self.c.last_success_gap({"last_success": "2026-11-20T11:40:00+00:00"}))
+
+
+class DriftInBackups(LocalCopy):
+    def test_nightly_records_drift_without_changing_results(self):
+        self.plan({"snapshots": {"stdout": json.dumps(nightlies(19, 20))},
+                   "local:snapshots": {"stdout": json.dumps(nightlies(20))}})
+        self.backup("nightly")
+        s = self.status()
+        self.assertEqual((s["backup"]["result"], s["local"]["backup"]["result"]), ("ok", "ok"))
+        self.assertIn("drift", s)
+        self.assertEqual(s["drift"]["off_site"]["snapshots"], 2)
+        self.assertEqual(s["drift"]["local"]["snapshots"], 1)
+        self.assertEqual(self.pings, ["https://hc.invalid/nightly/start", "https://hc.invalid/nightly"])
+
+    def test_nightly_drift_is_logged(self):
+        today = self.c.datetime.datetime.now(self.c.datetime.timezone.utc).date()
+        day = lambda n: (today - datetime.timedelta(days=n)).isoformat()
+        off_site = [snap(f"{day(n)}T11:37:00Z", "nightly") for n in range(4)]
+        local = [snap(f"{day(n)}T11:37:00Z", "nightly") for n in (0, 2, 3)]
+        self.plan({"snapshots": {"stdout": json.dumps(off_site)}, "local:snapshots": {"stdout": json.dumps(local)}})
+        self.backup("nightly")
+        s = self.status()
+        self.assertEqual(s["drift"]["problems"], [f"nightly {day(1)}: off-site only"])
+        self.assertEqual(s["local"]["backup"]["result"], "ok")
+        self.assertTrue(any("differ" in line for line in self.logs))
+
+    def test_frequent_runs_dont_measure_drift(self):
+        self.backup("frequent")
+        self.assertNotIn("drift", self.status())
+
+    def test_failed_local_backup_keeps_the_last_measurement(self):
+        self.c.status_merge(drift={"result": "ok", "problems": []})
+        self.server_down()
+        with self.assertRaises(self.c.Failed):
+            self.backup("nightly")
+        self.assertEqual(self.status()["drift"], {"result": "ok", "problems": []})
+
+    def test_status_shows_drift_from_last_success_even_before_measuring(self):
+        self.c.status_merge(last_success="2026-11-20T11:40:00+00:00", backup={"result": "ok"})
+        self.c.status_merge(under="local", last_success="2026-11-17T11:40:00+00:00", backup={"result": "failed"})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.c.cmd_status(argparse.Namespace(json=False))
+        self.assertRegex(out.getvalue(), r"\ndrift\s+drift\s+.*last successful backup is 72 h older")
+
+    def test_drift_command(self):
+        self.plan({"snapshots": {"stdout": json.dumps(nightlies(19, 20))},
+                   "local:snapshots": {"stdout": json.dumps(nightlies(19, 20))}})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.c.cmd_drift(argparse.Namespace(json=False))
+        self.assertRegex(out.getvalue(), r"^drift\s+ok")
+        self.assertEqual(self.status()["drift"]["result"], "ok")
+        self.plan({"snapshots": {"stdout": json.dumps(nightlies(19, 20))}, "local:snapshots": {"stdout": "[]"}})
+        with self.assertRaises(SystemExit), contextlib.redirect_stdout(io.StringIO()):
+            self.c.cmd_drift(argparse.Namespace(json=True))
+
+    def test_drift_command_waits_for_no_job(self):
+        with self.c.locked():
+            with self.assertRaisesRegex(self.c.Failed, "another cellar job"):
+                self.c.cmd_drift(argparse.Namespace(json=False))
+
+    def test_drift_command_needs_a_local_copy(self):
+        Path(self.c.ETC, "local.env").unlink()
+        with self.assertRaisesRegex(self.c.Failed, "no local copy"):
+            self.c.cmd_drift(argparse.Namespace(json=False))
 
 
 if __name__ == "__main__":

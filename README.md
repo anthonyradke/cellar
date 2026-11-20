@@ -34,7 +34,7 @@ flowchart LR
 ## Components
 
 - `bin/cellar`, a single Python script (standard library only) that wraps restic. Subcommands: `backup`, `check`,
-  `drill`, `status`, `snapshots`, `sources`, `restore`, `init`, `restic` (credentials loaded) and
+  `drill`, `status`, `drift`, `snapshots`, `sources`, `restore`, `init`, `restic` (credentials loaded) and
   `stopped`; `--local` or `--b2` picks one repository.
 - `systemd/`, a oneshot service and timer per job, at low CPU and idle IO priority:
 
@@ -75,6 +75,7 @@ flowchart LR
 
 ```bash
 sudo cellar status                 # last results per job and repository, repo size, size per source
+sudo cellar drift                  # compare both repositories now
 sudo cellar snapshots
 sudo cellar sources                # which sources.txt lines exist
 sudo cellar backup --tag pre-change
@@ -98,7 +99,10 @@ local copy:
   backup    ok          2026-10-26T11:37:02+00:00
   frequent  ok          2026-10-26T18:16:41+00:00
   repo      97 snapshots, 5.41 GB
+drift     ok          2026-10-26T11:37:30+00:00  newest 0 h apart, every day since 2026-10-21 matches
 ```
+
+The `drift` line flags the two repositories drifting apart ([docs/status.md](docs/status.md)).
 
 ## How a backup runs
 

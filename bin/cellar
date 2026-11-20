@@ -9,6 +9,7 @@ Usage:
   cellar drill                  restore the files in drill.txt to a temp dir and check them (the local copy
                                 restores the whole latest snapshot)
   cellar status [--json]        show the last results (from /var/lib/cellar/status.json)
+  cellar drift [--json]         compare the off-site repository with the local copy now (exit 1 if they differ)
   cellar snapshots              list snapshots
   cellar sources                show which source paths exist and which are missing
   cellar restore SNAPSHOT --target DIR [--include PATTERN ...]
@@ -77,6 +78,12 @@ PROBE_TIMEOUT = 10
 # The local copy is pruned by the machine that stores it. Frequent snapshots this much older than the newest
 # one mean that machine's prune has stopped running.
 PRUNE_OVERDUE = datetime.timedelta(hours=48)
+# Drift between the off-site repository and the local copy. Every nightly and manual job writes both within
+# minutes, so newest snapshots further apart than DRIFT_GAP mean one of them missed a run. DRIFT_DAYS is how
+# many days back each day's last snapshot per tag is compared: keep-daily 7 keeps those in both repositories
+# whichever side has pruned last, so a difference inside it is a real hole, not prune timing.
+DRIFT_GAP = datetime.timedelta(hours=12)
+DRIFT_DAYS = 6
 
 # Copies a live SQLite database with the backup API and checks the copy. Runs as the
 # database's owner so SQLite never creates root-owned -wal/-shm files next to the original.
@@ -551,6 +558,97 @@ def overdue_frequent(snaps):
     return sum(1 for t in times if newest - t > PRUNE_OVERDUE)
 
 
+def snapshot_days(snaps):
+    """The newest time of each (host, tags, day) among snapshots that aren't frequent, the way restic's
+    keep-daily groups them (day in the snapshot's own time zone)."""
+    days = {}
+    for s in snaps:
+        tags = s.get("tags") or []
+        if FREQUENT in tags or not s.get("time"):
+            continue
+        t = snapshot_time(s)
+        key = (s.get("hostname", ""), ",".join(sorted(tags)) or "untagged", t.date())
+        days[key] = max(days.get(key, t), t)
+    return days
+
+
+def hours(delta):
+    return round(delta.total_seconds() / 3600, 1)
+
+
+def drift(off_site, local, today=None):
+    """Compare the snapshot lists of the off-site repository and the local copy.
+
+    Two signals: how far apart the newest snapshots are (one side missed the latest run), and which recent
+    days have a snapshot for a tag on one side only (a hole left by an earlier failure, or a run made with
+    --b2 or --local). Frequent snapshots are ignored: they go off-site only. Only days both repositories
+    cover in full are compared, so the day the local copy was created never counts as a hole.
+    """
+    today = today or datetime.datetime.now(datetime.timezone.utc).date()
+    lists = {"off_site": off_site, "local": local}
+    sides = {name: snapshot_days(snaps) for name, snaps in lists.items()}
+    record = {"measured": now(), "result": "ok", "problems": []}
+    problems = record["problems"]
+    newest = {}
+    for name, days in sides.items():
+        newest[name] = max(days.values(), default=None)
+        count = sum(1 for s in lists[name] if FREQUENT not in (s.get("tags") or []))
+        record[name] = {"snapshots": count, "newest": newest[name].isoformat() if newest[name] else None}
+    if not (newest["off_site"] and newest["local"]):
+        empty = "off-site repository" if not newest["off_site"] else "local copy"
+        problems.append(f"the {empty} has no nightly or manual snapshots")
+    else:
+        gap = abs(newest["off_site"] - newest["local"])
+        record["gap_hours"] = hours(gap)
+        if gap > DRIFT_GAP:
+            behind = "local copy" if newest["local"] < newest["off_site"] else "off-site repository"
+            problems.append(f"the {behind}'s newest snapshot is {hours(gap):g} h older than the other's")
+        first = max(min(k[2] for k in days) for days in sides.values()) + datetime.timedelta(days=1)
+        start = max(first, today - datetime.timedelta(days=DRIFT_DAYS - 1))
+        record["compared_since"] = start.isoformat()
+        for name, other, where in (("off_site", "local", "off-site only"), ("local", "off_site", "local copy only")):
+            for host, tags, day in sorted(set(sides[name]) - set(sides[other])):
+                if start <= day <= today:
+                    problems.append(f"{tags} {day}: {where}")
+    if problems:
+        record["result"] = "drift"
+    return record
+
+
+def drift_line(record, extra=()):
+    """One status line for a drift record, with extra problems found from status.json since it was measured."""
+    problems = list(record.get("problems") or []) + list(extra)
+    result = "drift" if problems else record.get("result", "never")
+    line = f"{'drift':9} {result:11} {record.get('measured', '')}"
+    if problems:
+        return f"{line}  {'; '.join(problems)}"
+    if record:
+        line += f"  newest {record.get('gap_hours', 0):g} h apart, every day since {record.get('compared_since')} matches"
+    return line
+
+
+def last_success_gap(data):
+    """A problem string when the two repositories' last successful backups (from status.json) are further
+    apart than DRIFT_GAP, or None. Catches drift that began after the last measurement."""
+    local = data.get(LOCAL.key) or {}
+    times = [data.get("last_success"), local.get("last_success")]
+    if not all(times):
+        return None
+    off_site, here = (datetime.datetime.fromisoformat(t) for t in times)
+    if abs(off_site - here) <= DRIFT_GAP:
+        return None
+    behind = "local copy" if here < off_site else "off-site repository"
+    return f"the {behind}'s last successful backup is {hours(abs(off_site - here)):g} h older than the other's"
+
+
+def save_drift(off_site, local):
+    record = drift(off_site, local)
+    status_merge(drift=record)
+    if record["problems"]:
+        log(f"WARNING: the off-site repository and the local copy differ: {'; '.join(record['problems'])}")
+    return record
+
+
 def repo_stats(repo=B2, snaps=None):
     if snaps is None:
         snaps = restic_json("snapshots", repo=repo)
@@ -608,6 +706,7 @@ class BackupRun:
         self.extra = {}
         self.error = None
         self.done = False
+        self.snaps = None  # the repository's snapshot list after retention (nightly and manual runs)
 
     def save(self, **extra):
         status_merge(under=self.repo.key, **{self.section: self.record}, **extra)
@@ -666,7 +765,7 @@ class BackupRun:
                     restic("forget", *FORGET_GROUP, *KEEP, "--keep-tag", FREQUENT, "--prune", *prune_options(),
                            repo=self.repo)
             if nightly:
-                snaps = restic_json("snapshots", repo=self.repo)
+                snaps = self.snaps = restic_json("snapshots", repo=self.repo)
                 self.extra["repo"] = repo_stats(self.repo, snaps)
                 if self.repo is B2 and self.record["snapshot"]:
                     self.extra["sources"] = source_sizes(self.record["snapshot"], paths)
@@ -724,6 +823,7 @@ def run_backup(tag, kind, repos=None):
         for run in runs:
             run.retention(paths)
             run.finish(shared)
+        compare_runs(runs)
     except BaseException as e:
         error = str(e) or type(e).__name__
         for run in runs:
@@ -732,6 +832,35 @@ def run_backup(tag, kind, repos=None):
     failed = [f"{run.repo.label()}: {run.error}" for run in runs if run.error]
     if failed:
         raise Failed("; ".join(failed))
+
+
+def compare_runs(runs):
+    """After a nightly or manual job that wrote both repositories, record how far they have drifted apart.
+    Informational: it never changes a run's result, since each run already reports its own failures."""
+    lists = {run.repo: run.snaps for run in runs}
+    if lists.get(B2) is None or lists.get(LOCAL) is None:
+        return
+    try:
+        save_drift(lists[B2], lists[LOCAL])
+    except Exception as e:
+        log(f"WARNING: couldn't compare the two repositories: {e}")
+
+
+def cmd_drift(args):
+    """Compare both repositories' snapshot lists now, record the result and exit 1 if they differ."""
+    if not LOCAL.configured():
+        raise Failed(f"there's no local copy to compare: {ETC}/{LOCAL.env_file} is missing")
+    try:
+        with locked(wait=False):
+            record = save_drift(restic_json("snapshots"), restic_json("snapshots", repo=LOCAL))
+    except Busy:
+        raise Failed("another cellar job is running; its snapshots aren't all written yet, try again later")
+    if args.json:
+        print(json.dumps(record, indent=2))
+    else:
+        print(drift_line(record))
+    if record["problems"]:
+        sys.exit(1)
 
 
 @contextlib.contextmanager
@@ -957,6 +1086,8 @@ def cmd_status(args):
     if isinstance(local, dict):
         print("local copy:")
         show(local, "  ")
+        gap = last_success_gap(data)
+        print(drift_line(data.get("drift") or {}, [gap] if gap else []))
 
 
 def cmd_sources(args):
@@ -1031,6 +1162,9 @@ def main():
     p = sub.add_parser("status")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_status)
+    p = sub.add_parser("drift")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_drift)
     sub.add_parser("sources").set_defaults(func=cmd_sources)
     sub.add_parser("snapshots").set_defaults(func=cmd_snapshots)
     p = sub.add_parser("restore")
