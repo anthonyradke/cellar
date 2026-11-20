@@ -548,8 +548,8 @@ class SqliteCopy(CellarTest):
         self.assertEqual(target.read_text(), "keep")
 
 
-class LocalCopy(CellarTest):
-    """The optional second repository: an append-only rest-server on another machine."""
+class LocalCopyTest(CellarTest):
+    """Set-up for tests with the optional second repository: an append-only rest-server on another machine."""
 
     def setUp(self):
         super().setUp()
@@ -571,6 +571,8 @@ class LocalCopy(CellarTest):
         s.close()
         self.use_port(port)
 
+
+class LocalCopy(LocalCopyTest):
     def test_nightly_backs_up_both_and_never_prunes_the_local_copy(self):
         self.backup("nightly")
         self.assertEqual(len(self.calls_for("backup", "b2")), 1)
@@ -841,7 +843,7 @@ class Drift(CellarTest):
         self.assertIsNone(self.c.last_success_gap({"last_success": "2026-11-20T11:40:00+00:00"}))
 
 
-class DriftInBackups(LocalCopy):
+class DriftInBackups(LocalCopyTest):
     def test_nightly_records_drift_without_changing_results(self):
         self.plan({"snapshots": {"stdout": json.dumps(nightlies(19, 20))},
                    "local:snapshots": {"stdout": json.dumps(nightlies(20))}})
