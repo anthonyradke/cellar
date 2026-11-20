@@ -5,3 +5,10 @@
 /home/you/minecraft/logs
 /home/you/minecraft/libraries
 /home/you/minecraft/versions
+# A whole project folder (one with no remote, say): leave out secrets, dependencies and build output.
+/home/you/projects/**/.env
+/home/you/projects/**/.env.*
+/home/you/projects/**/node_modules
+/home/you/projects/**/.venv
+/home/you/projects/**/__pycache__
+/home/you/projects/app/dist
